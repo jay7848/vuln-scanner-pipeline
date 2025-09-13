@@ -11,6 +11,8 @@ pipeline {
   environment {
     PYTHONUNBUFFERED = '1'
     DOCKER_BUILDKIT  = '1'
+    // Docker Desktop exposes the daemon on the HOST; containers can reach it via this hostname
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375'
   }
 
   stages {
@@ -18,41 +20,40 @@ pipeline {
       steps { checkout scm }
     }
 
-    // Uses a short-lived docker CLI container running as root to check access
-    stage('Docker Sanity (helper)') {
+    stage('Docker Sanity (TCP)') {
       steps {
         sh '''
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            docker:27.3-cli docker version
+          docker version
         '''
       }
     }
 
-    // Build using the same helper container (so group perms on Jenkins don’t matter)
-    stage('Build Docker image (helper)') {
+    stage('Build Docker image (TCP)') {
       steps {
         retry(2) {
+          // use docker CLI in a helper container that talks to the daemon over TCP (no socket mount needed)
           sh '''
             docker run --rm \
-              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e DOCKER_HOST \
+              -e DOCKER_BUILDKIT \
               -v "$PWD":/w -w /w \
               docker:27.3-cli sh -lc '
-                DOCKER_BUILDKIT=1 docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
+                docker version &&
+                docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
               '
           '''
         }
       }
     }
 
-    // Python runs in its own container; still mounts docker.sock so scan.py can run dockerized Trivy
     stage('Scan & Generate Report') {
       steps {
+        // we need a docker client inside the Python container; mount host docker binary and point it to DOCKER_HOST
         sh '''
           mkdir -p reports
           docker run --rm \
+            -e DOCKER_HOST \
             -v "$PWD":/app -w /app \
-            -v /var/run/docker.sock:/var/run/docker.sock \
             -v /usr/bin/docker:/usr/bin/docker \
             python:3.11-slim bash -lc "
               pip install --no-cache-dir -r requirements.txt &&
@@ -72,8 +73,10 @@ pipeline {
         ]) {
           sh '''
             docker run --rm \
+              -e DOCKER_HOST \
               -v "$PWD":/app -w /app \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              -v /usr/bin/docker:/usr/bin/docker \
               python:3.11-slim bash -lc "
                 pip install --no-cache-dir -r requirements.txt &&
                 python scanner/notify_email.py \
