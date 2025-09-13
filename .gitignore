@@ -6,13 +6,21 @@ __pycache__/
 
 # Env & secrets & outputs
 .env
+.env.local
 *.env
 reports/
+*.html
+*.json
 keys/
 dist/
+
+# Docker
+*.log
 
 # Node/OS/IDE
 node_modules/
 .DS_Store
-.idea/
+Thumbs.db
 .vscode/
+.idea/
+
