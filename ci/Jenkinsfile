@@ -4,41 +4,41 @@ pipeline {
 
   parameters {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile in the repo to build')
     string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
-    string(name: 'REPO_URL',   defaultValue: '', description: 'Git repo URL (blank = autodetect)')
-    string(name: 'REPO_REF',   defaultValue: '', description: 'Git ref/branch (blank = autodetect)')
+    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL for build context')
+    string(name: 'REPO_REF',   defaultValue: 'main', description: 'Branch / ref to build from')
   }
 
   environment {
-    PYTHONUNBUFFERED = '1'
-    // Keep BuildKit on globally if you want; we override to 0 just for the build line.
-    DOCKER_BUILDKIT  = '1'
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375'  // Docker Desktop TCP
+    // We’re using Docker over TCP. BuildKit disabled to avoid buildx requirement.
+    DOCKER_BUILDKIT = '0'
+    // Ensure Jenkins picks up DOCKER_HOST from your global config (Option 1) or define it here if needed.
+    // DOCKER_HOST = 'tcp://host.docker.internal:2375'  // uncomment if you want to force it here
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
 
     stage('Sanity: Docker TCP') {
-      steps { sh 'docker version' }
+      steps {
+        sh '''
+          set -eux
+          docker version
+        '''
+      }
     }
 
     stage('Resolve repo (autodetect if blanks)') {
       steps {
         script {
-          // If params empty, read them from the workspace’s Git config/HEAD
+          // If user left params blank, try to infer from the workspace checkout.
           if (!params.REPO_URL?.trim()) {
-            env.REPO_URL = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' config --get remote.origin.url").trim()
+            env.REPO_URL = sh(script: 'git remote get-url origin', returnStdout: true).trim()
           } else {
             env.REPO_URL = params.REPO_URL.trim()
           }
           if (!params.REPO_REF?.trim()) {
-            // Try to get the short branch; fall back to 'main'
-            def ref = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' rev-parse --abbrev-ref HEAD || echo main").trim()
-            env.REPO_REF = ref ?: 'main'
+            env.REPO_REF = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
           } else {
             env.REPO_REF = params.REPO_REF.trim()
           }
@@ -49,11 +49,11 @@ pipeline {
 
     stage('Build image from Git (no mounts)') {
       steps {
-        // Classic builder (no buildx required) supports git URL contexts
         sh '''
+          set -eux
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-          DOCKER_BUILDKIT=0 docker build \
-            --pull \
+          # Build directly from remote Git context (no bind mounts, no local Dockerfile needed)
+          DOCKER_BUILDKIT=0 docker build --pull \
             -f "${DOCKERFILE}" \
             -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
             "${REPO_URL}#${REPO_REF}"
@@ -64,22 +64,25 @@ pipeline {
     stage('Scan & Generate Report (no mounts)') {
       steps {
         sh '''
-          # clone repo inside container, run scanner, then extract reports via tar
-          docker run --rm -e DOCKER_HOST python:3.11-slim bash -lc "
+          set -eux
+          # Run scanner inside a temporary Python container, then copy reports out
+          CID=$(docker create --rm -e DOCKER_HOST python:3.11-slim bash -lc '
             set -e
             apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-            git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
+            git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
             cd /app
             pip install --no-cache-dir -r requirements.txt
             mkdir -p reports
-            python scanner/scan.py '${IMAGE_NAME}:${BUILD_NUMBER}' 'reports/${IMAGE_NAME}.json'
-            python scanner/report.py 'reports/${IMAGE_NAME}.filtered.json' 'reports/${IMAGE_NAME}.html'
+            python -m scanner.scan "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" reports/"'${IMAGE_NAME}'".json
+            python -m scanner.report reports/"'${IMAGE_NAME}'".filtered.json reports/"'${IMAGE_NAME}'".html
             tar -czf /reports.tgz -C /app reports
-          "
-          CID=$(docker create --rm python:3.11-slim)
-          docker cp $CID:/reports.tgz reports.tgz || true
-          docker rm $CID >/dev/null 2>&1 || true
-          mkdir -p reports && tar -xzf reports.tgz -C . || true
+          ')
+          docker start -a "$CID"
+          docker cp "$CID:/reports.tgz" .
+          docker rm "$CID" >/dev/null
+          mkdir -p reports
+          tar -xzf reports.tgz
+          ls -la reports
         '''
       }
     }
@@ -92,24 +95,22 @@ pipeline {
           string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
           sh '''
-            # Create a temp container, inject the reports, then run notify
-            CID=$(docker create --rm \
-                 -e DOCKER_HOST -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-                 python:3.11-slim bash -lc "
-                   set -e
-                   apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-                   git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
-                   cd /app
-                   pip install --no-cache-dir -r requirements.txt
-                   tar -xzf /reports.tgz -C .
-                   python scanner/notify_email.py \
-                     --image       '${IMAGE_NAME}:${BUILD_NUMBER}' \
-                     --report-json 'reports/${IMAGE_NAME}.filtered.json' \
-                     --report-html 'reports/${IMAGE_NAME}.html' \
-                     --fail-on     '${SEVERITY}'
-                 ")
-            tar -czf - reports | docker cp - $CID:/reports.tgz
-            docker start -a $CID
+            set -eux
+            # Reuse local reports via a bind mount; clone repo to get the script
+            docker run --rm -e DOCKER_HOST \
+              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              -v "$PWD":/out python:3.11-slim bash -lc '
+                set -e
+                apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+                git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
+                cd /app
+                pip install --no-cache-dir -r requirements.txt
+                python -m scanner.notify_email \
+                  --image       "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" \
+                  --report-json "/out/reports/'"${IMAGE_NAME}"'.filtered.json" \
+                  --report-html "/out/reports/'"${IMAGE_NAME}"'.html" \
+                  --fail-on     "'"${SEVERITY}"'"
+              '
           '''
         }
       }
