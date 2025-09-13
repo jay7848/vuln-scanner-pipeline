@@ -1,0 +1,39 @@
+
+pipeline {
+  agent any
+  environment {
+    SEVERITY = "HIGH,CRITICAL"
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+    stage('Build') {
+      steps { sh 'docker build -t myapp:${BUILD_NUMBER} .' }
+    }
+    stage('Scan & Report') {
+      steps {
+        sh '''
+          python -m pip install -r requirements.txt
+          mkdir -p reports
+          # Try native trivy else dockerized via scanner/scan.py
+          if command -v trivy >/dev/null 2>&1; then
+            trivy image --format json --severity "$SEVERITY" myapp:${BUILD_NUMBER} > reports/myapp.json || true
+          else
+            echo "Using scanner/scan.py as wrapper"
+          fi
+          python scanner/scan.py myapp:${BUILD_NUMBER} reports/myapp.json
+          python scanner/report.py reports/myapp.filtered.json reports/myapp.html
+        '''
+      }
+    }
+    stage('Email & Gate') {
+      steps {
+        sh '''
+          python scanner/notify_email.py --image myapp:${BUILD_NUMBER}             --report-json reports/myapp.filtered.json             --report-html reports/myapp.html             --fail-on "$SEVERITY"
+        '''
+      }
+    }
+  }
+  post {
+    always { archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false }
+  }
+}

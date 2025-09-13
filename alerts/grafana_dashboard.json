@@ -1,0 +1,25 @@
+{
+  "title": "Vulnerability Overview",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "CRITICAL/HIGH by Image",
+      "targets": [
+        {
+          "expr": "sum by (image, severity) (image_vulnerabilities_total{severity=~\"CRITICAL|HIGH\"})"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "All Severities",
+      "targets": [
+        {
+          "expr": "sum by (severity) (image_vulnerabilities_total)"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

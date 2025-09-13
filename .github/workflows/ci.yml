@@ -1,0 +1,38 @@
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build image
+        run: docker build -t myapp:${{ github.sha }} .
+      - name: Scan & report
+        run: |
+          mkdir -p reports
+          python scanner/scan.py myapp:${{ github.sha }} reports/myapp.json
+          python scanner/report.py reports/myapp.filtered.json reports/myapp.html
+      - name: Email via Gmail
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python scanner/notify_email.py --image myapp:${{ github.sha }}             --report-json reports/myapp.filtered.json             --report-html reports/myapp.html             --fail-on "HIGH,CRITICAL" || true
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-reports
+          path: reports/*

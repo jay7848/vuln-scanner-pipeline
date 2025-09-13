@@ -1,0 +1,18 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Env & secrets & outputs
+.env
+*.env
+reports/
+keys/
+dist/
+
+# Node/OS/IDE
+node_modules/
+.DS_Store
+.idea/
+.vscode/

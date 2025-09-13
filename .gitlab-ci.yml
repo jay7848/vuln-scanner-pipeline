@@ -1,0 +1,38 @@
+
+stages: [build, scan, notify]
+
+variables:
+  SEVERITY: "HIGH,CRITICAL"
+
+build:
+  stage: build
+  image: docker:24
+  services: [docker:dind]
+  script:
+    - docker build -t myapp:$CI_COMMIT_SHA .
+  artifacts:
+    expire_in: 1 week
+    when: always
+
+scan:
+  stage: scan
+  image: python:3.11-slim
+  services: [docker:dind]
+  before_script:
+    - pip install -r requirements.txt
+  script:
+    - mkdir -p reports
+    - python scanner/scan.py myapp:$CI_COMMIT_SHA reports/myapp.json
+    - python scanner/report.py reports/myapp.filtered.json reports/myapp.html
+  artifacts:
+    paths: [reports/]
+    when: always
+
+notify:
+  stage: notify
+  image: python:3.11-slim
+  script:
+    - pip install -r requirements.txt
+    - python scanner/notify_email.py --image myapp:$CI_COMMIT_SHA         --report-json reports/myapp.filtered.json         --report-html reports/myapp.html         --fail-on "$SEVERITY" || true
+  dependencies: [scan]
+  when: always
