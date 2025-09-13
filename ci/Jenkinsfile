@@ -4,12 +4,13 @@ pipeline {
 
   parameters {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile to build (e.g., DemoApp.Dockerfile or Dockerfile)')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities (comma-separated)')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile to build')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
   }
 
   environment {
     PYTHONUNBUFFERED = '1'
+    DOCKER_BUILDKIT  = '1'
   }
 
   stages {
@@ -17,11 +18,24 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Build Docker image') {
+    stage('Docker Sanity') {
       steps {
         sh '''
-          docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
+          echo "whoami: $(whoami)"
+          id
+          ls -l /var/run/docker.sock || true
+          which docker || true
+          ls -l "$(which docker)" || true
+          docker version
         '''
+      }
+    }
+
+    stage('Build Docker image') {
+      steps {
+        retry(2) {
+          sh 'docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .'
+        }
       }
     }
 
