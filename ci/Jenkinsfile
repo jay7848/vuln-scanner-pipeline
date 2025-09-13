@@ -11,7 +11,9 @@ pipeline {
   environment {
     PYTHONUNBUFFERED = '1'
     DOCKER_BUILDKIT  = '1'
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375' // Docker Desktop TCP daemon
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375'
+    // Jenkins job dir inside the jenkins_home volume:
+    JOB_DIR          = '/jenkins_home/workspace/vuln-scanner-pipeline'
   }
 
   stages {
@@ -25,18 +27,18 @@ pipeline {
 
     stage('Build Docker image (TCP)') {
       steps {
-        // Quick visibility to avoid guessing
+        // Prove the file exists where we'll work inside the volume
         sh '''
-          echo "WORKSPACE=${WORKSPACE}"
-          ls -la "${WORKSPACE}"
-          test -f "${WORKSPACE}/${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not found at ${WORKSPACE}"; exit 2; }
+          ls -la "${JOB_DIR}"
+          test -f "${JOB_DIR}/${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not found at ${JOB_DIR}"; exit 2; }
         '''
         retry(2) {
           sh '''
             docker run --rm \
               -e DOCKER_HOST -e DOCKER_BUILDKIT \
               -e IMAGE_NAME -e DOCKERFILE -e BUILD_NUMBER \
-              -v "${WORKSPACE}":/w -w /w \
+              -v jenkins_home:/jenkins_home \
+              -w "${JOB_DIR}" \
               docker:27.3-cli sh -lc '
                 echo "Container CWD: $(pwd)"; ls -la .
                 test -f "${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not visible inside container"; exit 3; }
@@ -50,11 +52,13 @@ pipeline {
     stage('Scan & Generate Report') {
       steps {
         sh '''
-          mkdir -p reports
+          # Ensure reports dir exists in the volume path
+          mkdir -p "${JOB_DIR}/reports"
           docker run --rm \
             -e DOCKER_HOST \
             -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
-            -v "${WORKSPACE}":/app -w /app \
+            -v jenkins_home:/jenkins_home \
+            -w "${JOB_DIR}" \
             -v /usr/bin/docker:/usr/bin/docker \
             python:3.11-slim bash -lc "
               ls -la .
@@ -78,7 +82,8 @@ pipeline {
               -e DOCKER_HOST \
               -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "${WORKSPACE}":/app -w /app \
+              -v jenkins_home:/jenkins_home \
+              -w "${JOB_DIR}" \
               -v /usr/bin/docker:/usr/bin/docker \
               python:3.11-slim bash -lc "
                 pip install --no-cache-dir -r requirements.txt &&
