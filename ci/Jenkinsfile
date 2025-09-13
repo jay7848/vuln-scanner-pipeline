@@ -11,8 +11,7 @@ pipeline {
   environment {
     PYTHONUNBUFFERED = '1'
     DOCKER_BUILDKIT  = '1'
-    // Docker Desktop exposes the daemon on the HOST; containers can reach it via this hostname
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375'
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375' // Docker Desktop TCP
   }
 
   stages {
@@ -21,21 +20,16 @@ pipeline {
     }
 
     stage('Docker Sanity (TCP)') {
-      steps {
-        sh '''
-          docker version
-        '''
-      }
+      steps { sh 'docker version' }
     }
 
     stage('Build Docker image (TCP)') {
       steps {
         retry(2) {
-          // use docker CLI in a helper container that talks to the daemon over TCP (no socket mount needed)
           sh '''
             docker run --rm \
-              -e DOCKER_HOST \
-              -e DOCKER_BUILDKIT \
+              -e DOCKER_HOST -e DOCKER_BUILDKIT \
+              -e IMAGE_NAME -e DOCKERFILE -e BUILD_NUMBER \
               -v "$PWD":/w -w /w \
               docker:27.3-cli sh -lc '
                 docker version &&
@@ -48,11 +42,11 @@ pipeline {
 
     stage('Scan & Generate Report') {
       steps {
-        // we need a docker client inside the Python container; mount host docker binary and point it to DOCKER_HOST
         sh '''
           mkdir -p reports
           docker run --rm \
             -e DOCKER_HOST \
+            -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
             -v "$PWD":/app -w /app \
             -v /usr/bin/docker:/usr/bin/docker \
             python:3.11-slim bash -lc "
@@ -74,8 +68,9 @@ pipeline {
           sh '''
             docker run --rm \
               -e DOCKER_HOST \
-              -v "$PWD":/app -w /app \
+              -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              -v "$PWD":/app -w /app \
               -v /usr/bin/docker:/usr/bin/docker \
               python:3.11-slim bash -lc "
                 pip install --no-cache-dir -r requirements.txt &&
