@@ -18,27 +18,34 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Docker Sanity') {
+    // Uses a short-lived docker CLI container running as root to check access
+    stage('Docker Sanity (helper)') {
       steps {
         sh '''
-          echo "whoami: $(whoami)"
-          id
-          ls -l /var/run/docker.sock || true
-          which docker || true
-          ls -l "$(which docker)" || true
-          docker version
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            docker:27.3-cli docker version
         '''
       }
     }
 
-    stage('Build Docker image') {
+    // Build using the same helper container (so group perms on Jenkins don’t matter)
+    stage('Build Docker image (helper)') {
       steps {
         retry(2) {
-          sh 'docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .'
+          sh '''
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$PWD":/w -w /w \
+              docker:27.3-cli sh -lc '
+                DOCKER_BUILDKIT=1 docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
+              '
+          '''
         }
       }
     }
 
+    // Python runs in its own container; still mounts docker.sock so scan.py can run dockerized Trivy
     stage('Scan & Generate Report') {
       steps {
         sh '''
