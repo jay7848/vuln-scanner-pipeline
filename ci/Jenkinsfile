@@ -11,7 +11,7 @@ pipeline {
   environment {
     PYTHONUNBUFFERED = '1'
     DOCKER_BUILDKIT  = '1'
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375' // Docker Desktop TCP
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375' // Docker Desktop TCP daemon
   }
 
   stages {
@@ -25,14 +25,21 @@ pipeline {
 
     stage('Build Docker image (TCP)') {
       steps {
+        // Quick visibility to avoid guessing
+        sh '''
+          echo "WORKSPACE=${WORKSPACE}"
+          ls -la "${WORKSPACE}"
+          test -f "${WORKSPACE}/${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not found at ${WORKSPACE}"; exit 2; }
+        '''
         retry(2) {
           sh '''
             docker run --rm \
               -e DOCKER_HOST -e DOCKER_BUILDKIT \
               -e IMAGE_NAME -e DOCKERFILE -e BUILD_NUMBER \
-              -v "$PWD":/w -w /w \
+              -v "${WORKSPACE}":/w -w /w \
               docker:27.3-cli sh -lc '
-                docker version &&
+                echo "Container CWD: $(pwd)"; ls -la .
+                test -f "${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not visible inside container"; exit 3; }
                 docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
               '
           '''
@@ -47,9 +54,10 @@ pipeline {
           docker run --rm \
             -e DOCKER_HOST \
             -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
-            -v "$PWD":/app -w /app \
+            -v "${WORKSPACE}":/app -w /app \
             -v /usr/bin/docker:/usr/bin/docker \
             python:3.11-slim bash -lc "
+              ls -la .
               pip install --no-cache-dir -r requirements.txt &&
               python scanner/scan.py \\"${IMAGE_NAME}:${BUILD_NUMBER}\\" \\"reports/${IMAGE_NAME}.json\\" &&
               python scanner/report.py \\"reports/${IMAGE_NAME}.filtered.json\\" \\"reports/${IMAGE_NAME}.html\\"
@@ -70,7 +78,7 @@ pipeline {
               -e DOCKER_HOST \
               -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "$PWD":/app -w /app \
+              -v "${WORKSPACE}":/app -w /app \
               -v /usr/bin/docker:/usr/bin/docker \
               python:3.11-slim bash -lc "
                 pip install --no-cache-dir -r requirements.txt &&
