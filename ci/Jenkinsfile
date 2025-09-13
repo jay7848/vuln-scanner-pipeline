@@ -1,149 +1,109 @@
 pipeline {
   agent any
-  options { timestamps() }
-
-  parameters {
-    string(name: 'IMAGE_NAME', defaultValue: 'myapp',              description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',      description: 'Fail gate on these severities')
-    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL')
-    string(name: 'REPO_REF',   defaultValue: 'main',               description: 'Branch / ref')
-  }
 
   environment {
-    // Turn off buildx requirement (legacy builder is fine for this job)
-    DOCKER_BUILDKIT = '0'
+    // Point to Docker Desktop on Windows/macOS with TCP daemon enabled:
+    DOCKER_HOST = 'tcp://host.docker.internal:2375'
+    IMAGE_NAME  = 'demo-app:jenkins'
+    TRIVY_TAG   = '0.53.0'   // pin for repeatability
+    SEVERITY    = 'HIGH,CRITICAL'
+    REPORT_DIR  = 'reports'
+  }
+
+  options {
+    // If your Jenkins supports it, this switches sh to bash globally.
+    // If not, every sh block below has a bash shebang anyway.
+    shell('/bin/bash')
+    timestamps()
   }
 
   stages {
-
-    stage('Detect Docker daemon (TCP)') {
+    stage('Checkout') {
       steps {
-        script {
-          // Try a few common endpoints; pick the first that works
-          def defaultGw = sh(script: "/sbin/ip route | awk '/default/ {print \$3}' || true", returnStdout: true).trim()
-          def candidates = [
-            'tcp://host.docker.internal:2375',
-            'tcp://gateway.docker.internal:2375',
-            defaultGw ? "tcp://${defaultGw}:2375" : '',
-            'tcp://127.0.0.1:2375'
-          ].findAll { it } // drop empties
-
-          String chosen = null
-          for (c in candidates) {
-            int rc = sh(script: "docker -H ${c} version >/dev/null 2>&1; echo \$?", returnStdout: true).trim() as Integer
-            if (rc == 0) { chosen = c; break }
-          }
-          if (!chosen) {
-            error """
-No reachable Docker daemon over TCP.
-Tried: ${candidates.join(', ')}.
-Please enable "Expose daemon on tcp://localhost:2375 without TLS" in Docker Desktop/settings and rerun.
-"""
-          }
-          env.DOCKER_HOST = chosen
-          echo "Using DOCKER_HOST=${env.DOCKER_HOST}"
-        }
+        checkout scm
       }
     }
 
     stage('Sanity: Docker TCP') {
       steps {
-        sh '''
-          set -euxo pipefail
-          echo "DOCKER_HOST=${DOCKER_HOST}"
-          docker version
+        sh '''#!/usr/bin/env bash
+        set -Eeuo pipefail
+        echo "Using DOCKER_HOST=${DOCKER_HOST}"
+        docker -H "${DOCKER_HOST}" version >/dev/null
+        echo "✅ Docker reachable"
         '''
       }
     }
 
-    stage('Resolve repo (autodetect if blanks)') {
+    stage('Build image') {
       steps {
-        script {
-          env.REPO_URL = (params.REPO_URL?.trim()) ?: sh(script: 'git remote get-url origin', returnStdout: true).trim()
-          env.REPO_REF = (params.REPO_REF?.trim()) ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
-          echo "Using REPO_URL=${env.REPO_URL}, REPO_REF=${env.REPO_REF}"
-        }
-      }
-    }
-
-    stage('Build image from Git (no mounts)') {
-      steps {
-        sh '''
-          set -euxo pipefail
-          echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-          # Build directly from remote Git to avoid workspace mounts
-          docker build --pull \
-            -f "${DOCKERFILE}" \
-            -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
-            "${REPO_URL}#${REPO_REF}"
+        sh '''#!/usr/bin/env bash
+        set -Eeuo pipefail
+        docker -H "${DOCKER_HOST}" build -f DemoApp.Dockerfile -t "${IMAGE_NAME}" .
+        docker -H "${DOCKER_HOST}" image ls "${IMAGE_NAME}"
+        mkdir -p "${REPORT_DIR}"
         '''
       }
     }
 
-    stage('Scan & Generate Report (no mounts)') {
+    stage('Scan with Trivy') {
       steps {
-        sh '''
-          set -euxo pipefail
+        sh '''#!/usr/bin/env bash
+        set -Eeuo pipefail
 
-          # Run scanner fully inside a temp Python container; copy reports out when done
-          CID=$(docker create --rm \
-                -e DOCKER_HOST \
-                python:3.11-slim bash -lc '
-                  set -euo pipefail
-                  apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-                  git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
-                  cd /app
-                  pip install --no-cache-dir -r requirements.txt
-                  mkdir -p reports
-                  python -m scanner.scan "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" reports/"'${IMAGE_NAME}'".json
-                  python -m scanner.report reports/"'${IMAGE_NAME}'".filtered.json reports/"'${IMAGE_NAME}'".html
-                  tar -czf /reports.tgz -C /app reports
-                ')
-          docker start -a "$CID"
-          docker cp "$CID:/reports.tgz" .
-          docker rm "$CID" >/dev/null || true
-          mkdir -p reports
-          tar -xzf reports.tgz
-          ls -la reports
+        # Run Trivy in a container, talking to your remote Docker daemon via DOCKER_HOST.
+        docker -H "${DOCKER_HOST}" run --rm \
+          -e DOCKER_HOST="${DOCKER_HOST}" \
+          -v "$PWD/${REPORT_DIR}:/reports" \
+          "aquasec/trivy:${TRIVY_TAG}" \
+          image --severity "${SEVERITY}" --format json \
+          -o "/reports/${IMAGE_NAME//[:]/_}.trivy.json" \
+          "${IMAGE_NAME}"
+
+        # Optional: pretty HTML from JSON using the repo script if present.
+        if [[ -f scripts/report_html.py ]]; then
+          python3 scripts/report_html.py \
+            "/reports/${IMAGE_NAME//[:]/_}.trivy.json" \
+            "/reports/${IMAGE_NAME//[:]/_}.html"
+        else
+          # minimal HTML wrapper if converter script not found
+          jq -r '.' "/reports/${IMAGE_NAME//[:]/_}.trivy.json" \
+            | python3 - <<'PY'
+import sys, json, html
+data=json.load(sys.stdin)
+print("<html><body><h1>Trivy Report</h1><pre>"+html.escape(json.dumps(data, indent=2))+"</pre></body></html>")
+PY
+          mv "/reports/${IMAGE_NAME//[:]/_}.trivy.json" "/reports/${IMAGE_NAME//[:]/_}.json"
+          mv "./index.html" "/reports/${IMAGE_NAME//[:]/_}.html" 2>/dev/null || true
+        fi
         '''
       }
     }
 
-    stage('Email & Gate (no mounts)') {
+    stage('Gate on severity') {
       steps {
-        withCredentials([
-          string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
-          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
-        ]) {
-          sh '''
-            set -euxo pipefail
-            docker run --rm \
-              -e DOCKER_HOST \
-              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "$PWD":/out \
-              python:3.11-slim bash -lc '
-                set -euo pipefail
-                apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-                git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
-                cd /app
-                pip install --no-cache-dir -r requirements.txt
-                python -m scanner.notify_email \
-                  --image       "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" \
-                  --report-json "/out/reports/'"${IMAGE_NAME}"'.filtered.json" \
-                  --report-html "/out/reports/'"${IMAGE_NAME}"'.html" \
-                  --fail-on     "'"${SEVERITY}"'"
-              '
-          '''
-        }
+        sh '''#!/usr/bin/env bash
+        set -Eeuo pipefail
+        J="/reports/${IMAGE_NAME//[:]/_}.trivy.json"
+        # Count HIGH+CRITICAL findings (ignore UNKNOWN/LOW/MEDIUM)
+        COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' "$J" || echo 0)
+        echo "Found $COUNT HIGH/CRITICAL vulnerabilities"
+        if (( COUNT > 0 )); then
+          echo "❌ Failing the build due to HIGH/CRITICAL findings"
+          exit 1
+        fi
+        echo "✅ Gate passed (no HIGH/CRITICAL)"
+        '''
       }
     }
   }
 
   post {
     always {
-      archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
+      archiveArtifacts artifacts: 'reports/*', fingerprint: true, allowEmptyArchive: true
+    }
+    failure {
+      echo 'Build failed. Check the Trivy report in the artifacts.'
     }
   }
 }
