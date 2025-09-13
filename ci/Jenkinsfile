@@ -1,39 +1,78 @@
-
 pipeline {
   agent any
+  options {
+    timestamps()
+  }
+
+  parameters {
+    string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile to build (e.g., DemoApp.Dockerfile or Dockerfile)')
+    string(name: 'SEVERITY', defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities (comma-separated)')
+  }
+
   environment {
-    SEVERITY = "HIGH,CRITICAL"
+    PYTHONUNBUFFERED = '1'
   }
+
   stages {
-    stage('Checkout') { steps { checkout scm } }
-    stage('Build') {
-      steps { sh 'docker build -t myapp:${BUILD_NUMBER} .' }
+    stage('Checkout') {
+      steps { checkout scm }
     }
-    stage('Scan & Report') {
+
+    stage('Set up Python deps') {
       steps {
         sh '''
-          python -m pip install -r requirements.txt
-          mkdir -p reports
-          # Try native trivy else dockerized via scanner/scan.py
-          if command -v trivy >/dev/null 2>&1; then
-            trivy image --format json --severity "$SEVERITY" myapp:${BUILD_NUMBER} > reports/myapp.json || true
-          else
-            echo "Using scanner/scan.py as wrapper"
-          fi
-          python scanner/scan.py myapp:${BUILD_NUMBER} reports/myapp.json
-          python scanner/report.py reports/myapp.filtered.json reports/myapp.html
+          # Pick python3 if available, else python
+          PY=$(command -v python3 || command -v python)
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install -r requirements.txt
         '''
       }
     }
-    stage('Email & Gate') {
+
+    stage('Build Docker image') {
       steps {
         sh '''
-          python scanner/notify_email.py --image myapp:${BUILD_NUMBER}             --report-json reports/myapp.filtered.json             --report-html reports/myapp.html             --fail-on "$SEVERITY"
+          docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
         '''
+      }
+    }
+
+    stage('Scan & Generate Report') {
+      steps {
+        sh '''
+          mkdir -p reports
+          # Wrapper will use native trivy if present, else dockerized trivy via Docker socket
+          PY=$(command -v python3 || command -v python)
+          "$PY" scanner/scan.py "${IMAGE_NAME}:${BUILD_NUMBER}" "reports/${IMAGE_NAME}.json"
+          "$PY" scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
+        '''
+      }
+    }
+
+    stage('Email & Gate (Gmail)') {
+      steps {
+        withCredentials([
+          string(credentialsId: 'GMAIL_USER',          variable: 'GMAIL_USER'),
+          string(credentialsId: 'GMAIL_APP_PASSWORD',  variable: 'GMAIL_APP_PASSWORD'),
+          string(credentialsId: 'EMAIL_TO',            variable: 'EMAIL_TO')
+        ]) {
+          sh '''
+            PY=$(command -v python3 || command -v python)
+            "$PY" scanner/notify_email.py \
+              --image       "${IMAGE_NAME}:${BUILD_NUMBER}" \
+              --report-json "reports/${IMAGE_NAME}.filtered.json" \
+              --report-html "reports/${IMAGE_NAME}.html" \
+              --fail-on     "${SEVERITY}"
+          '''
+        }
       }
     }
   }
+
   post {
-    always { archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false }
+    always {
+      archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
+    }
   }
 }
