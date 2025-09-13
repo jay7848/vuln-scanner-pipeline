@@ -4,73 +4,69 @@ pipeline {
 
   parameters {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile to build')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo (e.g., DemoApp.Dockerfile)')
     string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
+    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL')
+    string(name: 'REPO_REF',   defaultValue: 'main', description: 'Git ref/branch')
   }
 
   environment {
     PYTHONUNBUFFERED = '1'
     DOCKER_BUILDKIT  = '1'
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375'
-    // Jenkins job dir inside the jenkins_home volume:
-    JOB_DIR          = '/jenkins_home/workspace/vuln-scanner-pipeline'
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375' // Docker Desktop (Settings → Expose daemon on 2375)
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    stage('Docker Sanity (TCP)') {
-      steps { sh 'docker version' }
-    }
-
-    stage('Build Docker image (TCP)') {
+    stage('Sanity: Docker TCP') {
       steps {
-        // Prove the file exists where we'll work inside the volume
-        sh '''
-          ls -la "${JOB_DIR}"
-          test -f "${JOB_DIR}/${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not found at ${JOB_DIR}"; exit 2; }
-        '''
-        retry(2) {
-          sh '''
-            docker run --rm \
-              -e DOCKER_HOST -e DOCKER_BUILDKIT \
-              -e IMAGE_NAME -e DOCKERFILE -e BUILD_NUMBER \
-              -v jenkins_home:/jenkins_home \
-              -w "${JOB_DIR}" \
-              docker:27.3-cli sh -lc '
-                echo "Container CWD: $(pwd)"; ls -la .
-                test -f "${DOCKERFILE}" || { echo "❌ ${DOCKERFILE} not visible inside container"; exit 3; }
-                docker build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
-              '
-          '''
-        }
+        sh 'docker version'
       }
     }
 
-    stage('Scan & Generate Report') {
+    stage('Build image from Git (no mounts)') {
       steps {
+        // Build using Git context; Docker will fetch the source directly.
+        // NOTE: If your Dockerfile isn’t at repo root, set DOCKERFILE accordingly (e.g., ci/DemoApp.Dockerfile).
         sh '''
-          # Ensure reports dir exists in the volume path
-          mkdir -p "${JOB_DIR}/reports"
+          echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
+          docker build \
+            --pull \
+            -f "${DOCKERFILE}" \
+            -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
+            "${REPO_URL}#${REPO_REF}"
+        '''
+      }
+    }
+
+    stage('Scan & Generate Report (no mounts)') {
+      steps {
+        // Clone repo inside the Python container, then run scanner scripts there.
+        // We pass DOCKER_HOST so scan.py can use dockerized Trivy via TCP.
+        sh '''
           docker run --rm \
             -e DOCKER_HOST \
-            -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
-            -v jenkins_home:/jenkins_home \
-            -w "${JOB_DIR}" \
-            -v /usr/bin/docker:/usr/bin/docker \
             python:3.11-slim bash -lc "
-              ls -la .
-              pip install --no-cache-dir -r requirements.txt &&
-              python scanner/scan.py \\"${IMAGE_NAME}:${BUILD_NUMBER}\\" \\"reports/${IMAGE_NAME}.json\\" &&
-              python scanner/report.py \\"reports/${IMAGE_NAME}.filtered.json\\" \\"reports/${IMAGE_NAME}.html\\"
+              set -e
+              apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+              git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
+              cd /app
+              pip install --no-cache-dir -r requirements.txt
+              mkdir -p reports
+              python scanner/scan.py '${IMAGE_NAME}:${BUILD_NUMBER}' 'reports/${IMAGE_NAME}.json'
+              python scanner/report.py 'reports/${IMAGE_NAME}.filtered.json' 'reports/${IMAGE_NAME}.html'
+              # save artifacts to a simple tar we can pull out
+              tar -czf /reports.tgz -C /app reports
             "
+          # copy artifacts out of the container via stdout (no mounts)
+          CID=$(docker create --rm python:3.11-slim)
+          docker cp $CID:/reports.tgz reports.tgz || true
+          docker rm $CID >/dev/null 2>&1 || true
+          mkdir -p reports && tar -xzf reports.tgz -C . || true
         '''
       }
     }
 
-    stage('Email & Gate (Gmail)') {
+    stage('Email & Gate (no mounts)') {
       steps {
         withCredentials([
           string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
@@ -80,19 +76,32 @@ pipeline {
           sh '''
             docker run --rm \
               -e DOCKER_HOST \
-              -e IMAGE_NAME -e BUILD_NUMBER -e SEVERITY \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v jenkins_home:/jenkins_home \
-              -w "${JOB_DIR}" \
-              -v /usr/bin/docker:/usr/bin/docker \
               python:3.11-slim bash -lc "
-                pip install --no-cache-dir -r requirements.txt &&
-                python scanner/notify_email.py \
-                  --image       \\"${IMAGE_NAME}:${BUILD_NUMBER}\\" \
-                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \
-                  --report-html \\"reports/${IMAGE_NAME}.html\\" \
-                  --fail-on     \\"${SEVERITY}\\"
+                set -e
+                apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+                git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
+                cd /app
+                pip install --no-cache-dir -r requirements.txt
+                # Fetch the latest reports from the previous stage into this container
+                # (we stream in the tarball via STDIN to avoid mounts)
               "
+            # stream local reports into a temp container and send email
+            CID=$(docker create --rm -e DOCKER_HOST -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO python:3.11-slim bash -lc "
+              set -e
+              apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+              git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
+              cd /app
+              pip install --no-cache-dir -r requirements.txt
+              tar -xzf /reports.tgz -C .
+              python scanner/notify_email.py \
+                --image       '${IMAGE_NAME}:${BUILD_NUMBER}' \
+                --report-json 'reports/${IMAGE_NAME}.filtered.json' \
+                --report-html 'reports/${IMAGE_NAME}.html' \
+                --fail-on     '${SEVERITY}'
+            ")
+            tar -czf - reports | docker cp - $CID:/reports.tgz
+            docker start -a $CID
           '''
         }
       }
