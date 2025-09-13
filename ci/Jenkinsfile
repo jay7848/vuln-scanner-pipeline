@@ -3,26 +3,55 @@ pipeline {
   options { timestamps() }
 
   parameters {
-    string(name: 'IMAGE_NAME', defaultValue: 'myapp',               description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile',  description: 'Dockerfile path in repo')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',       description: 'Fail gate on these severities')
-    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL for build/scan')
-    string(name: 'REPO_REF',   defaultValue: 'main',                description: 'Branch / ref')
+    string(name: 'IMAGE_NAME', defaultValue: 'myapp',              description: 'Docker image name to build & scan')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',      description: 'Fail gate on these severities')
+    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL')
+    string(name: 'REPO_REF',   defaultValue: 'main',               description: 'Branch / ref')
   }
 
   environment {
-    // Using Docker over TCP; no /var/run/docker.sock mounts required
-    DOCKER_BUILDKIT = '0'   // avoid buildx requirement inside daemon
-    // If you didn’t set DOCKER_HOST globally in Jenkins, uncomment and set here:
-    // DOCKER_HOST = 'tcp://host.docker.internal:2375'
+    // Turn off buildx requirement (legacy builder is fine for this job)
+    DOCKER_BUILDKIT = '0'
   }
 
   stages {
 
+    stage('Detect Docker daemon (TCP)') {
+      steps {
+        script {
+          // Try a few common endpoints; pick the first that works
+          def defaultGw = sh(script: "/sbin/ip route | awk '/default/ {print \$3}' || true", returnStdout: true).trim()
+          def candidates = [
+            'tcp://host.docker.internal:2375',
+            'tcp://gateway.docker.internal:2375',
+            defaultGw ? "tcp://${defaultGw}:2375" : '',
+            'tcp://127.0.0.1:2375'
+          ].findAll { it } // drop empties
+
+          String chosen = null
+          for (c in candidates) {
+            int rc = sh(script: "docker -H ${c} version >/dev/null 2>&1; echo \$?", returnStdout: true).trim() as Integer
+            if (rc == 0) { chosen = c; break }
+          }
+          if (!chosen) {
+            error """
+No reachable Docker daemon over TCP.
+Tried: ${candidates.join(', ')}.
+Please enable "Expose daemon on tcp://localhost:2375 without TLS" in Docker Desktop/settings and rerun.
+"""
+          }
+          env.DOCKER_HOST = chosen
+          echo "Using DOCKER_HOST=${env.DOCKER_HOST}"
+        }
+      }
+    }
+
     stage('Sanity: Docker TCP') {
       steps {
         sh '''
-          set -eux
+          set -euxo pipefail
+          echo "DOCKER_HOST=${DOCKER_HOST}"
           docker version
         '''
       }
@@ -41,9 +70,10 @@ pipeline {
     stage('Build image from Git (no mounts)') {
       steps {
         sh '''
-          set -eux
+          set -euxo pipefail
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-          DOCKER_BUILDKIT=0 docker build --pull \
+          # Build directly from remote Git to avoid workspace mounts
+          docker build --pull \
             -f "${DOCKERFILE}" \
             -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
             "${REPO_URL}#${REPO_REF}"
@@ -54,22 +84,25 @@ pipeline {
     stage('Scan & Generate Report (no mounts)') {
       steps {
         sh '''
-          set -eux
-          # Run the scanner fully inside a temp Python container, then copy reports out
-          CID=$(docker create --rm -e DOCKER_HOST python:3.11-slim bash -lc '
-            set -e
-            apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-            git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
-            cd /app
-            pip install --no-cache-dir -r requirements.txt
-            mkdir -p reports
-            python -m scanner.scan "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" reports/"'${IMAGE_NAME}'".json
-            python -m scanner.report reports/"'${IMAGE_NAME}'".filtered.json reports/"'${IMAGE_NAME}'".html
-            tar -czf /reports.tgz -C /app reports
-          ')
+          set -euxo pipefail
+
+          # Run scanner fully inside a temp Python container; copy reports out when done
+          CID=$(docker create --rm \
+                -e DOCKER_HOST \
+                python:3.11-slim bash -lc '
+                  set -euo pipefail
+                  apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+                  git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
+                  cd /app
+                  pip install --no-cache-dir -r requirements.txt
+                  mkdir -p reports
+                  python -m scanner.scan "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" reports/"'${IMAGE_NAME}'".json
+                  python -m scanner.report reports/"'${IMAGE_NAME}'".filtered.json reports/"'${IMAGE_NAME}'".html
+                  tar -czf /reports.tgz -C /app reports
+                ')
           docker start -a "$CID"
           docker cp "$CID:/reports.tgz" .
-          docker rm "$CID" >/dev/null
+          docker rm "$CID" >/dev/null || true
           mkdir -p reports
           tar -xzf reports.tgz
           ls -la reports
@@ -85,12 +118,13 @@ pipeline {
           string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
           sh '''
-            set -eux
-            # Use a clean Python container to send the email, mounting only the reports
-            docker run --rm -e DOCKER_HOST \
+            set -euxo pipefail
+            docker run --rm \
+              -e DOCKER_HOST \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "$PWD":/out python:3.11-slim bash -lc '
-                set -e
+              -v "$PWD":/out \
+              python:3.11-slim bash -lc '
+                set -euo pipefail
                 apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
                 git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
                 cd /app
