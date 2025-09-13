@@ -3,18 +3,18 @@ pipeline {
   options { timestamps() }
 
   parameters {
-    string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
-    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile in the repo to build')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
-    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL for build context')
-    string(name: 'REPO_REF',   defaultValue: 'main', description: 'Branch / ref to build from')
+    string(name: 'IMAGE_NAME', defaultValue: 'myapp',               description: 'Docker image name to build & scan')
+    string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile',  description: 'Dockerfile path in repo')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',       description: 'Fail gate on these severities')
+    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL for build/scan')
+    string(name: 'REPO_REF',   defaultValue: 'main',                description: 'Branch / ref')
   }
 
   environment {
-    // We’re using Docker over TCP. BuildKit disabled to avoid buildx requirement.
-    DOCKER_BUILDKIT = '0'
-    // Ensure Jenkins picks up DOCKER_HOST from your global config (Option 1) or define it here if needed.
-    // DOCKER_HOST = 'tcp://host.docker.internal:2375'  // uncomment if you want to force it here
+    // Using Docker over TCP; no /var/run/docker.sock mounts required
+    DOCKER_BUILDKIT = '0'   // avoid buildx requirement inside daemon
+    // If you didn’t set DOCKER_HOST globally in Jenkins, uncomment and set here:
+    // DOCKER_HOST = 'tcp://host.docker.internal:2375'
   }
 
   stages {
@@ -31,17 +31,8 @@ pipeline {
     stage('Resolve repo (autodetect if blanks)') {
       steps {
         script {
-          // If user left params blank, try to infer from the workspace checkout.
-          if (!params.REPO_URL?.trim()) {
-            env.REPO_URL = sh(script: 'git remote get-url origin', returnStdout: true).trim()
-          } else {
-            env.REPO_URL = params.REPO_URL.trim()
-          }
-          if (!params.REPO_REF?.trim()) {
-            env.REPO_REF = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
-          } else {
-            env.REPO_REF = params.REPO_REF.trim()
-          }
+          env.REPO_URL = (params.REPO_URL?.trim()) ?: sh(script: 'git remote get-url origin', returnStdout: true).trim()
+          env.REPO_REF = (params.REPO_REF?.trim()) ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
           echo "Using REPO_URL=${env.REPO_URL}, REPO_REF=${env.REPO_REF}"
         }
       }
@@ -52,7 +43,6 @@ pipeline {
         sh '''
           set -eux
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-          # Build directly from remote Git context (no bind mounts, no local Dockerfile needed)
           DOCKER_BUILDKIT=0 docker build --pull \
             -f "${DOCKERFILE}" \
             -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
@@ -65,7 +55,7 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # Run scanner inside a temporary Python container, then copy reports out
+          # Run the scanner fully inside a temp Python container, then copy reports out
           CID=$(docker create --rm -e DOCKER_HOST python:3.11-slim bash -lc '
             set -e
             apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
@@ -96,7 +86,7 @@ pipeline {
         ]) {
           sh '''
             set -eux
-            # Reuse local reports via a bind mount; clone repo to get the script
+            # Use a clean Python container to send the email, mounting only the reports
             docker run --rm -e DOCKER_HOST \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
               -v "$PWD":/out python:3.11-slim bash -lc '
