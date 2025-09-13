@@ -1,13 +1,11 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-  }
+  options { timestamps() }
 
   parameters {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
     string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile to build (e.g., DemoApp.Dockerfile or Dockerfile)')
-    string(name: 'SEVERITY', defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities (comma-separated)')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities (comma-separated)')
   }
 
   environment {
@@ -17,17 +15,6 @@ pipeline {
   stages {
     stage('Checkout') {
       steps { checkout scm }
-    }
-
-    stage('Set up Python deps') {
-      steps {
-        sh '''
-          # Pick python3 if available, else python
-          PY=$(command -v python3 || command -v python)
-          "$PY" -m pip install --upgrade pip
-          "$PY" -m pip install -r requirements.txt
-        '''
-      }
     }
 
     stage('Build Docker image') {
@@ -42,10 +29,15 @@ pipeline {
       steps {
         sh '''
           mkdir -p reports
-          # Wrapper will use native trivy if present, else dockerized trivy via Docker socket
-          PY=$(command -v python3 || command -v python)
-          "$PY" scanner/scan.py "${IMAGE_NAME}:${BUILD_NUMBER}" "reports/${IMAGE_NAME}.json"
-          "$PY" scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
+          docker run --rm \
+            -v "$PWD":/app -w /app \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /usr/bin/docker:/usr/bin/docker \
+            python:3.11-slim bash -lc "
+              pip install --no-cache-dir -r requirements.txt &&
+              python scanner/scan.py \\"${IMAGE_NAME}:${BUILD_NUMBER}\\" \\"reports/${IMAGE_NAME}.json\\" &&
+              python scanner/report.py \\"reports/${IMAGE_NAME}.filtered.json\\" \\"reports/${IMAGE_NAME}.html\\"
+            "
         '''
       }
     }
@@ -53,17 +45,22 @@ pipeline {
     stage('Email & Gate (Gmail)') {
       steps {
         withCredentials([
-          string(credentialsId: 'GMAIL_USER',          variable: 'GMAIL_USER'),
-          string(credentialsId: 'GMAIL_APP_PASSWORD',  variable: 'GMAIL_APP_PASSWORD'),
-          string(credentialsId: 'EMAIL_TO',            variable: 'EMAIL_TO')
+          string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
+          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
+          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
           sh '''
-            PY=$(command -v python3 || command -v python)
-            "$PY" scanner/notify_email.py \
-              --image       "${IMAGE_NAME}:${BUILD_NUMBER}" \
-              --report-json "reports/${IMAGE_NAME}.filtered.json" \
-              --report-html "reports/${IMAGE_NAME}.html" \
-              --fail-on     "${SEVERITY}"
+            docker run --rm \
+              -v "$PWD":/app -w /app \
+              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              python:3.11-slim bash -lc "
+                pip install --no-cache-dir -r requirements.txt &&
+                python scanner/notify_email.py \
+                  --image       \\"${IMAGE_NAME}:${BUILD_NUMBER}\\" \
+                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \
+                  --report-html \\"reports/${IMAGE_NAME}.html\\" \
+                  --fail-on     \\"${SEVERITY}\\"
+              "
           '''
         }
       }
