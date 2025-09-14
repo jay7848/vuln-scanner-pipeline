@@ -1,12 +1,13 @@
 pipeline {
   agent any
   options {
+    ansiColor('xterm')
     timestamps()
     timeout(time: 60, unit: 'MINUTES')
   }
 
   environment {
-    SEVERITY = "HIGH,CRITICAL"
+    SEVERITY  = "HIGH,CRITICAL"
     IMAGE_NAME = "demo-app"
     IMAGE_TAG  = "dev"
     DOCKERFILE = "DemoApp.Dockerfile"
@@ -34,7 +35,6 @@ pipeline {
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
-          # Use legacy builder off (BuildKit on) unless you specifically want legacy
           docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
           mkdir -p reports
         '''
@@ -43,7 +43,7 @@ pipeline {
 
     stage('Scan & Generate Report') {
       steps {
-        // 1) Run Trivy (dockerized) to produce raw JSON (non-fatal if it finds vulns)
+        // 1) Trivy (dockerized) → raw JSON
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
@@ -58,16 +58,17 @@ pipeline {
               "${IMAGE_NAME}:${IMAGE_TAG}" > "reports/${IMAGE_NAME}.json" || true
         '''
 
-        // 2) Run our Python wrappers in a clean container
+        // 2) Python wrappers (inside container) → filtered JSON + HTML
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
+            -e IMAGE_NAME="${IMAGE_NAME}" \
+            -e IMAGE_TAG="${IMAGE_TAG}" \
             -v "$WORKSPACE":/work -w /work \
             python:3.11-slim bash -lc '
               set -Eeuo pipefail
               python -V
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-              # Use direct script paths (avoid module import issues)
               python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
               python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
               ls -al reports
@@ -86,8 +87,11 @@ pipeline {
           sh '''#!/usr/bin/env bash
             set -Eeuo pipefail
             docker run --rm \
-              -v "$WORKSPACE":/work -w /work \
+              -e IMAGE_NAME="${IMAGE_NAME}" \
+              -e IMAGE_TAG="${IMAGE_TAG}" \
+              -e SEVERITY="${SEVERITY}" \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              -v "$WORKSPACE":/work -w /work \
               python:3.11-slim bash -lc "
                 set -Eeuo pipefail
                 [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
