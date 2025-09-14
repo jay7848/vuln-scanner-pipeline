@@ -3,16 +3,30 @@ pipeline {
 
   options {
     timestamps()
-    timeout(time: 1, unit: 'HOURS')
+    timeout(time: 60, unit: 'MINUTES')
+  }
+
+  parameters {
+    string(name: 'SEVERITY', defaultValue: 'HIGH,CRITICAL', description: 'Comma-separated severities to include')
+    string(name: 'FAIL_ON',  defaultValue: 'CRITICAL',       description: 'Fail build on this severity or above')
+    booleanParam(name: 'PREWARM_DB', defaultValue: false, description: 'Pre-download Trivy DB')
   }
 
   environment {
-    IMAGE_NAME = 'myapp'
-    DOCKER_BUILDKIT = '1'
+    IMAGE_NAME  = 'myapp'
+    DOCKERFILE  = 'DemoApp.Dockerfile'
+
+    TRIVY_CACHE             = '/tmp/trivy-cache'
+    TRIVY_TIMEOUT           = '40m'
+    TRIVY_DB_REPOSITORY     = 'public.ecr.aws/aquasecurity/trivy-db:2'
+    TRIVY_JAVA_DB_REPOSITORY= 'public.ecr.aws/aquasecurity/trivy-java-db:1'
+
+    // Safe defaults without bash-style expansion
+    SEVERITY_IN      = "${SEVERITY ?: 'HIGH,CRITICAL'}"
+    FAIL_ON_SEVERITY = "${FAIL_ON  ?: 'CRITICAL'}"
   }
 
   stages {
-
     stage('Docker availability') {
       steps {
         sh '''
@@ -27,12 +41,10 @@ pipeline {
     stage('Resolve repo info') {
       steps {
         script {
-          sh """
-            REPO_URL=\$(git -C "${WORKSPACE}" config --get remote.origin.url)
-            REPO_SHA=\$(git -C "${WORKSPACE}" rev-parse HEAD)
-            echo "Using REPO_URL=${REPO_URL}"
-            echo "Using REPO_SHA=${REPO_SHA}"
-          """
+          env.REPO_URL = sh(script: "git -C '${env.WORKSPACE}' config --get remote.origin.url", returnStdout: true).trim()
+          env.REPO_SHA = sh(script: "git -C '${env.WORKSPACE}' rev-parse HEAD",               returnStdout: true).trim()
+          echo "Using REPO_URL=${env.REPO_URL}"
+          echo "Using REPO_SHA=${env.REPO_SHA}"
         }
       }
     }
@@ -40,21 +52,32 @@ pipeline {
     stage('Build image from workspace') {
       steps {
         sh '''
-          set -e
+          set -euxo pipefail
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from workspace at ${WORKSPACE}"
-          docker build --pull -f DemoApp.Dockerfile -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+          DOCKER_BUILDKIT=1 docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" "${WORKSPACE}"
           docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}' | grep -E "^${IMAGE_NAME}[[:space:]]+${BUILD_NUMBER}\\b"
         '''
       }
     }
 
     stage('Warm Trivy DB cache (optional)') {
-      when { expression { return false } } // flip to true if you want a pre-warm
+      when { expression { return params.PREWARM_DB } }
       steps {
         sh '''
-          set -e
-          docker run --rm aquasec/trivy:0.52.2 --download-db-only --no-progress || \
-          docker run --rm aquasec/trivy:0.52.2 --reset --download-db-only --no-progress
+          set -eux
+          docker run --rm \
+            -e TRIVY_CACHE_DIR="${TRIVY_CACHE}" \
+            -e TRIVY_DB_REPOSITORY="${TRIVY_DB_REPOSITORY}" \
+            -e TRIVY_JAVA_DB_REPOSITORY="${TRIVY_JAVA_DB_REPOSITORY}" \
+            python:3.11-slim bash -lc '
+              set -eux
+              apt-get update -qq
+              apt-get install -y -qq curl ca-certificates && rm -rf /var/lib/apt/lists/*
+              TRIVY_VER=0.52.2
+              curl -fsSL -o /tmp/trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_Linux-64bit.tar.gz"
+              tar -C /usr/local/bin -xzf /tmp/trivy.tgz trivy
+              trivy --download-db-only --no-progress || trivy --reset --download-db-only --no-progress
+            '
         '''
       }
     }
@@ -62,157 +85,154 @@ pipeline {
     stage('Scan & Generate Report') {
       steps {
         sh '''
-          set -euo pipefail
-          # Run a lightweight Python container, mount workspace & docker.sock, install only what we need
+          set -euxo pipefail
           docker run --rm \
             -e IMAGE_NAME="${IMAGE_NAME}" \
             -e BUILD_NUMBER="${BUILD_NUMBER}" \
-            -e TRIVY_CACHE_DIR="/tmp/trivy-cache" \
-            -e TRIVY_TIMEOUT="40m" \
-            -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2" \
-            -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1" \
+            -e TRIVY_CACHE_DIR="${TRIVY_CACHE}" \
+            -e TRIVY_TIMEOUT="${TRIVY_TIMEOUT}" \
+            -e TRIVY_DB_REPOSITORY="${TRIVY_DB_REPOSITORY}" \
+            -e TRIVY_JAVA_DB_REPOSITORY="${TRIVY_JAVA_DB_REPOSITORY}" \
+            -e SEVERITY_IN="${SEVERITY_IN}" \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${WORKSPACE}":/app \
             -w /app \
             python:3.11-slim bash -lc '
-              set -euo pipefail
-
+              set -euxo pipefail
               apt-get update -qq
-              apt-get install -y -qq curl ca-certificates >/dev/null
-
-              # Install Trivy (static binary)
+              # Lighter than docker.io; we only need the client
+              apt-get install -y -qq curl ca-certificates git docker-cli && rm -rf /var/lib/apt/lists/*
               TRIVY_VER=0.52.2
               curl -fsSL -o /tmp/trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_Linux-64bit.tar.gz"
               tar -C /usr/local/bin -xzf /tmp/trivy.tgz trivy
               trivy -v
-
               python -V
-
-              # Install Python deps for your local scanner code
-              if [ -f /app/requirements.txt ]; then
-                pip install --no-cache-dir -r /app/requirements.txt
-              else
-                echo "requirements.txt not found at /app/requirements.txt"
-                echo "Add one to the repo root (e.g., jinja2, requests, PyYAML, etc.)"
-                exit 1
-              fi
-
+              echo "Workspace contents:" ; ls -lah /app
+              pip install --no-cache-dir -r /app/requirements.txt
               mkdir -p /app/reports
-
-              # Make sure Python can import the local scanner package
-              export PYTHONPATH=/app
-
-              # Pre-download Trivy DB (faster, more reliable)
               trivy --download-db-only --no-progress || trivy --reset --download-db-only --no-progress
-
-              # Run the scanner (expected to produce filtered JSON + HTML)
               python -m scanner.scan   "${IMAGE_NAME}:${BUILD_NUMBER}" "/app/reports/${IMAGE_NAME}.json"
-              python -m scanner.report "/app/reports/${IMAGE_NAME}.filtered.json" "/app/reports/${IMAGE_NAME}.html"
+              python -m scanner.report "/app/reports/${IMAGE_NAME}.filtered.json" "/app/reports/${IMAGE_NAME}.html" --severity "${SEVERITY_IN}"
+              tar -czf /app/reports.tgz -C /app reports
             '
         '''
+      }
+    }
+
+    stage('Email Gate (send & enforce threshold)') {
+      when { always() }
+      steps {
+        script {
+          env.RESULT = currentBuild.currentResult ?: 'SUCCESS'
+        }
+        withCredentials([
+          string(credentialsId: 'GMAIL_USER',          variable: 'GMAIL_USER'),
+          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
+          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO'),
+          string(credentialsId: 'EMAIL_FROM_NAME',    variable: 'EMAIL_FROM_NAME'),
+          string(credentialsId: 'SLACK_WEBHOOK',      variable: 'SLACK_WEBHOOK')
+        ]) {
+          sh '''
+            set -euxo pipefail
+
+            # Write a tiny mailer script to workspace
+            cat > send_email.py << "PY"
+            import os, mimetypes, smtplib, ssl, json
+            from email.message import EmailMessage
+
+            GMAIL_USER = os.environ["GMAIL_USER"]
+            GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+            EMAIL_TO = os.environ["EMAIL_TO"]
+            EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "Vuln Scanner")
+            SUBJECT_PREFIX = os.environ.get("SUBJECT_PREFIX", "[VulnScan]")
+            RESULT = os.environ.get("RESULT", "UNKNOWN")
+            JOB_NAME = os.environ.get("JOB_NAME", "job")
+            BUILD_NUM = os.environ.get("BUILD_NUM", "0")
+            BUILD_URL = os.environ.get("BUILD_URL", "")
+            IMAGE_NAME = os.environ.get("IMAGE_NAME", "image")
+            FAIL_ON = os.environ.get("FAIL_ON_SEVERITY", "CRITICAL")
+
+            def maybe_attach(msg, path):
+                if os.path.exists(path):
+                    ctype, _ = mimetypes.guess_type(path)
+                    if ctype is None: ctype = "application/octet-stream"
+                    maintype, subtype = ctype.split("/", 1)
+                    with open(path, "rb") as f:
+                        msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
+
+            # Pull a few counts (if the JSON exists)
+            counts = {}
+            filtered_json = f"reports/{IMAGE_NAME}.filtered.json"
+            if os.path.exists(filtered_json):
+                try:
+                    data = json.load(open(filtered_json))
+                    counts = data.get("summary", {}) or {}
+                except Exception:
+                    pass
+
+            subj = f"{SUBJECT_PREFIX} {JOB_NAME} build #{BUILD_NUM} {RESULT}"
+            msg = EmailMessage()
+            msg["Subject"] = subj
+            msg["From"] = f"{EMAIL_FROM_NAME} <{GMAIL_USER}>"
+            msg["To"] = EMAIL_TO
+
+            text = f"""\
+            {JOB_NAME} build #{BUILD_NUM} finished with {RESULT}.
+
+            Build URL: {BUILD_URL}
+            Image: {IMAGE_NAME}:{BUILD_NUM}
+
+            Summary: {counts}
+            Fail-on severity: {FAIL_ON}
+            """
+            html = f"""\
+            <html><body>
+            <h3>{JOB_NAME} build #{BUILD_NUM} — {RESULT}</h3>
+            <p><b>Build URL:</b> <a href="{BUILD_URL}">{BUILD_URL}</a><br/>
+            <b>Image:</b> {IMAGE_NAME}:{BUILD_NUM}<br/>
+            <b>Fail-on severity:</b> {FAIL_ON}</p>
+            <pre>Summary: {counts}</pre>
+            <p>See attached HTML report for details.</p>
+            </body></html>
+            """
+            msg.set_content(text)
+            msg.add_alternative(html, subtype="html")
+
+            maybe_attach(msg, f"reports/{IMAGE_NAME}.html")
+            maybe_attach(msg, f"reports/{IMAGE_NAME}.json")
+            maybe_attach(msg, "reports.tgz")
+
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtp.gmail.com"), int(os.environ.get("SMTP_PORT", "465")), context=ctx) as s:
+                s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                s.send_message(msg)
+            print("Email sent")
+            PY
+
+            docker run --rm \
+              -e GMAIL_USER="$GMAIL_USER" \
+              -e GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD" \
+              -e EMAIL_TO="$EMAIL_TO" \
+              -e EMAIL_FROM_NAME="$EMAIL_FROM_NAME" \
+              -e SUBJECT_PREFIX="[VulnScan]" \
+              -e SMTP_HOST="smtp.gmail.com" \
+              -e SMTP_PORT="465" \
+              -e RESULT="${RESULT}" \
+              -e JOB_NAME="${JOB_NAME}" \
+              -e BUILD_NUM="${BUILD_NUMBER}" \
+              -e BUILD_URL="${BUILD_URL}" \
+              -e IMAGE_NAME="${IMAGE_NAME}" \
+              -e FAIL_ON_SEVERITY="${FAIL_ON_SEVERITY}" \
+              -v "$PWD":/out -w /out python:3.11-slim python /out/send_email.py
+          '''
+        }
       }
     }
   }
 
   post {
     always {
-      // Archive reports even if the build fails
-      archiveArtifacts artifacts: 'reports/**', fingerprint: true, onlyIfSuccessful: false
-
-      // Send email with artifacts attached, using Jenkins credentials (no secrets in logs)
-      script {
-        def buildResult = currentBuild.currentResult ?: 'UNKNOWN'
-        withEnv(["RESULT=${buildResult}"]) {
-          withCredentials([
-            string(credentialsId: 'GMAIL_USER',          variable: 'GMAIL_USER'),
-            string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-            string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO'),
-            string(credentialsId: 'EMAIL_FROM_NAME',    variable: 'EMAIL_FROM_NAME')
-          ]) {
-            sh '''
-              set -euo pipefail
-              SUBJECT_PREFIX="[VulnScan]"
-              SMTP_HOST="smtp.gmail.com"
-              SMTP_PORT="465"
-
-              docker run --rm \
-                -e GMAIL_USER \
-                -e GMAIL_APP_PASSWORD \
-                -e EMAIL_TO \
-                -e EMAIL_FROM_NAME \
-                -e SUBJECT_PREFIX \
-                -e SMTP_HOST \
-                -e SMTP_PORT \
-                -e RESULT \
-                -e JOB_NAME="${JOB_NAME}" \
-                -e BUILD_NUM="${BUILD_NUMBER}" \
-                -e BUILD_URL="${BUILD_URL}" \
-                -e IMAGE_NAME="${IMAGE_NAME}" \
-                -v "${WORKSPACE}":/out \
-                python:3.11-slim sh -lc 'python - <<\\PY
-import os, smtplib, ssl, mimetypes
-from email.message import EmailMessage
-
-def read_file(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
-
-user = os.environ.get("GMAIL_USER")
-app_pw = os.environ.get("GMAIL_APP_PASSWORD")
-to = os.environ.get("EMAIL_TO")
-from_name = os.environ.get("EMAIL_FROM_NAME", "Vuln Scanner")
-sub_prefix = os.environ.get("SUBJECT_PREFIX", "[VulnScan]")
-smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-smtp_port = int(os.environ.get("SMTP_PORT", "465"))
-
-result = os.environ.get("RESULT", "UNKNOWN")
-job = os.environ.get("JOB_NAME", "job")
-build = os.environ.get("BUILD_NUM", "0")
-url = os.environ.get("BUILD_URL", "")
-image = os.environ.get("IMAGE_NAME", "image")
-
-outdir = "/out/reports"
-html_path = f"{outdir}/{image}.html"
-json_path = f"{outdir}/{image}.filtered.json"
-
-msg = EmailMessage()
-sender = f"{from_name} <{user}>"
-msg["From"] = sender
-msg["To"] = to
-msg["Subject"] = f"{sub_prefix} {job} build #{build} {result}"
-msg.set_content("See HTML version for details.")
-msg.add_alternative(f"""
-<p><b>Job:</b> {job}<br/>
-<b>Build:</b> #{build}<br/>
-<b>Result:</b> {result}<br/>
-<b>Image:</b> {image}<br/>
-<b>URL:</b> <a href="{url}">{url}</a></p>
-<p>Artifacts are attached when available.</p>
-""", subtype="html")
-
-for path in (html_path, json_path):
-    data = read_file(path)
-    if not data:
-        continue
-    ctype, _ = mimetypes.guess_type(path)
-    if ctype is None:
-        ctype = "application/octet-stream"
-    maintype, subtype = ctype.split("/", 1)
-    msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=os.path.basename(path))
-
-context = ssl.create_default_context()
-with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
-    server.login(user, app_pw)
-    server.send_message(msg)
-print("Email sent to", to)
-PY'
-            '''
-          }
-        }
-      }
+      archiveArtifacts artifacts: 'reports/**, reports.tgz', allowEmptyArchive: true
     }
   }
 }
