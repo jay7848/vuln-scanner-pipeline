@@ -7,8 +7,8 @@ pipeline {
   }
 
   environment {
-    IMAGE_NAME    = 'myapp'
-    DOCKERFILE    = 'DemoApp.Dockerfile'
+    IMAGE_NAME = 'myapp'
+    DOCKERFILE = 'DemoApp.Dockerfile'
 
     TRIVY_VERSION            = '0.52.2'
     TRIVY_CACHE_DIR          = "${env.WORKSPACE}/.trivy-cache"
@@ -16,7 +16,7 @@ pipeline {
     TRIVY_DB_REPOSITORY      = 'public.ecr.aws/aquasecurity/trivy-db:2'
     TRIVY_JAVA_DB_REPOSITORY = 'public.ecr.aws/aquasecurity/trivy-java-db:1'
 
-    // Jenkins credentials IDs (existing in your screenshot)
+    // Jenkins credentials (configured in your instance)
     GMAIL_USER         = credentials('GMAIL_USER')
     GMAIL_APP_PASSWORD = credentials('GMAIL_APP_PASSWORD')
     EMAIL_TO           = credentials('EMAIL_TO')
@@ -28,14 +28,12 @@ pipeline {
 
     stage('Docker availability') {
       steps {
-        sh """
-          bash -lc '
-            set -Eeuo pipefail
-            command -v docker
-            docker version
-            echo "✅ Docker reachable"
-          '
-        """
+        sh(script: '''bash -lc '
+          set -Eeuo pipefail
+          command -v docker
+          docker version
+          echo "✅ Docker reachable"
+        ' ''')
       }
     }
 
@@ -52,165 +50,168 @@ pipeline {
 
     stage('Build image from workspace') {
       steps {
-        sh """
-          bash -lc '
-            set -Eeuo pipefail
-            echo "Building ${env.IMAGE_NAME}:${env.BUILD_NUMBER} from ${env.WORKSPACE}"
-            DOCKER_BUILDKIT=1 docker build --pull \
-              -f "${env.DOCKERFILE}" \
-              -t "${env.IMAGE_NAME}:${env.BUILD_NUMBER}" \
-              "${env.WORKSPACE}"
+        sh(script: '''bash -lc '
+          set -Eeuo pipefail
+          echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${WORKSPACE}"
 
-            docker images --format "table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\\t{{.Size}}" \
-              | grep -E "^${env.IMAGE_NAME}[[:space:]]+${env.BUILD_NUMBER}\\\\b"
-          '
-        """
+          # Use BuildKit only if buildx is available; else fallback to legacy builder.
+          if docker buildx version >/dev/null 2>&1; then
+            echo "Using BuildKit (buildx detected)"
+            export DOCKER_BUILDKIT=1
+          else
+            echo "buildx not found; falling back to legacy builder"
+            export DOCKER_BUILDKIT=0
+          fi
+
+          docker build --pull \
+            -f "${DOCKERFILE}" \
+            -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
+            "${WORKSPACE}"
+
+          docker images --format "table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\\t{{.Size}}" \
+            | grep -E "^${IMAGE_NAME}[[:space:]]+${BUILD_NUMBER}\\\\b"
+        ' ''')
       }
     }
 
     stage('Warm Trivy DB cache (optional)') {
-      when { expression { false } } // flip to true to enable
+      when { expression { false } } // set to true if you want to pre-warm
       steps {
-        sh """
-          bash -lc "
-            set -Eeuo pipefail
-            mkdir -p '${env.TRIVY_CACHE_DIR}'
-            docker run --rm -e TRIVY_CACHE_DIR=/tmp/trivy-cache \
-              -v '${env.TRIVY_CACHE_DIR}:/tmp/trivy-cache' \
-              aquasec/trivy:${env.TRIVY_VERSION} \
-              --download-db-only --no-progress || true
-          "
-        """
+        sh(script: '''bash -lc "
+          set -Eeuo pipefail
+          mkdir -p '${TRIVY_CACHE_DIR}'
+          docker run --rm -e TRIVY_CACHE_DIR=/tmp/trivy-cache \
+            -v '${TRIVY_CACHE_DIR}:/tmp/trivy-cache' \
+            aquasec/trivy:${TRIVY_VERSION} \
+            --download-db-only --no-progress || true
+        " ''')
       }
     }
 
     stage('Scan & Generate Report') {
       steps {
-        sh """
-          bash -lc "
-            set -Eeuo pipefail
+        sh(script: '''bash -lc "
+          set -Eeuo pipefail
 
-            docker run --rm \
-              -e IMAGE_NAME='${env.IMAGE_NAME}' \
-              -e BUILD_NUMBER='${env.BUILD_NUMBER}' \
-              -e TRIVY_CACHE_DIR='/tmp/trivy-cache' \
-              -e TRIVY_TIMEOUT='${env.TRIVY_TIMEOUT}' \
-              -e TRIVY_DB_REPOSITORY='${env.TRIVY_DB_REPOSITORY}' \
-              -e TRIVY_JAVA_DB_REPOSITORY='${env.TRIVY_JAVA_DB_REPOSITORY}' \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              -v '${env.WORKSPACE}:/app' -w /app \
-              python:3.11-slim bash -lc \"
-                set -Eeuo pipefail
-                apt-get update -qq
-                apt-get install -y -qq curl ca-certificates docker.io >/dev/null
+          docker run --rm \
+            -e IMAGE_NAME='${IMAGE_NAME}' \
+            -e BUILD_NUMBER='${BUILD_NUMBER}' \
+            -e TRIVY_CACHE_DIR='/tmp/trivy-cache' \
+            -e TRIVY_TIMEOUT='${TRIVY_TIMEOUT}' \
+            -e TRIVY_DB_REPOSITORY='${TRIVY_DB_REPOSITORY}' \
+            -e TRIVY_JAVA_DB_REPOSITORY='${TRIVY_JAVA_DB_REPOSITORY}' \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v '${WORKSPACE}:/app' -w /app \
+            python:3.11-slim bash -lc \"
+              set -Eeuo pipefail
+              apt-get update -qq
+              apt-get install -y -qq curl ca-certificates docker.io >/dev/null
 
-                TRIVY_VER='${env.TRIVY_VERSION}'
-                curl -fsSL -o /tmp/trivy.tgz \\\\
-                  'https://github.com/aquasecurity/trivy/releases/download/v'\\\$TRIVY_VER'/trivy_'\\\$TRIVY_VER'_Linux-64bit.tar.gz'
-                tar -C /usr/local/bin -xzf /tmp/trivy.tgz trivy
-                trivy -v
+              TRIVY_VER='${TRIVY_VERSION}'
+              curl -fsSL -o /tmp/trivy.tgz \\\\
+                'https://github.com/aquasecurity/trivy/releases/download/v'\\\$TRIVY_VER'/trivy_'\\\$TRIVY_VER'_Linux-64bit.tar.gz'
+              tar -C /usr/local/bin -xzf /tmp/trivy.tgz trivy
+              trivy -v
 
-                python -V
-                if [ -f requirements.txt ]; then
-                  pip install --no-cache-dir -r requirements.txt
-                else
-                  echo 'requirements.txt not found — skipping pip install'
-                fi
+              python -V
+              if [ -f requirements.txt ]; then
+                pip install --no-cache-dir -r requirements.txt
+              else
+                echo 'requirements.txt not found — skipping pip install'
+              fi
 
-                mkdir -p reports
-                trivy --download-db-only --no-progress || trivy --reset --download-db-only --no-progress
+              mkdir -p reports
+              trivy --download-db-only --no-progress || trivy --reset --download-db-only --no-progress
 
-                python -m scanner.scan   '${env.IMAGE_NAME}:${env.BUILD_NUMBER}' 'reports/${env.IMAGE_NAME}.json'
-                python -m scanner.report 'reports/${env.IMAGE_NAME}.filtered.json' 'reports/${env.IMAGE_NAME}.html'
+              python -m scanner.scan   '${IMAGE_NAME}:${BUILD_NUMBER}' 'reports/${IMAGE_NAME}.json'
+              python -m scanner.report 'reports/${IMAGE_NAME}.filtered.json' 'reports/${IMAGE_NAME}.html'
 
-                tar -czf /reports.tgz -C /app reports
-              \"
-          "
-        """
+              tar -czf /reports.tgz -C /app reports
+            \"
+        " ''')
       }
     }
   }
 
   post {
     always {
+      script {
+        // capture result once (so we can use it in a shell without Groovy interpolation)
+        env.PIPE_RESULT = currentBuild.currentResult ?: 'UNKNOWN'
+      }
+
       archiveArtifacts artifacts: 'reports/**, reports.tgz', allowEmptyArchive: true
 
-      // send email without using any Python triple-quotes
-      sh """
-        bash -lc "
-          set -Eeuo pipefail
+      // Send email by piping the script via stdin. No bind mounts, no Groovy interpolation of secrets.
+      sh(script: '''bash -lc '
+        set -Eeuo pipefail
 
-          # Write mailer to a temp file (literal heredoc to avoid shell expansion)
-          cat > /tmp/send_email.py <<'PY'
+        docker run --rm -i \
+          --env GMAIL_USER \
+          --env GMAIL_APP_PASSWORD \
+          --env EMAIL_TO \
+          --env EMAIL_FROM_NAME \
+          --env SMTP_HOST=smtp.gmail.com \
+          --env SMTP_PORT=465 \
+          --env RESULT="$PIPE_RESULT" \
+          --env JOB_NAME="$JOB_NAME" \
+          --env BUILD_NUM="$BUILD_NUMBER" \
+          --env BUILD_URL="$BUILD_URL" \
+          --env IMAGE_NAME="$IMAGE_NAME" \
+          python:3.11-slim python - <<'"'"'PY'"'"'
 import os, smtplib, ssl, mimetypes, email.utils
+
 from email.message import EmailMessage
 
-user = os.environ['GMAIL_USER']
-pwd  = os.environ['GMAIL_APP_PASSWORD']
-to   = os.environ['EMAIL_TO']
-from_name = os.environ.get('EMAIL_FROM_NAME','Vuln Scanner')
+user = os.environ["GMAIL_USER"]
+pwd  = os.environ["GMAIL_APP_PASSWORD"]
+to   = os.environ["EMAIL_TO"]
+from_name = os.environ.get("EMAIL_FROM_NAME","Vuln Scanner")
 
-subject = '[VulnScan] {job} build #{num} {res}'.format(
-    job=os.environ.get('JOB_NAME','job'),
-    num=os.environ.get('BUILD_NUM',''),
-    res=os.environ.get('RESULT','')
+subject = "[VulnScan] {job} build #{num} {res}".format(
+    job=os.environ.get("JOB_NAME","job"),
+    num=os.environ.get("BUILD_NUM",""),
+    res=os.environ.get("RESULT","")
 ).strip()
 
 body = (
-    'Job: {job}\\n'
-    'Build: #{num}\\n'
-    'URL: {url}\\n'
-    'Image: {image}\\n'
-    'Result: {res}\\n'
+    "Job: {job}\\n"
+    "Build: #{num}\\n"
+    "URL: {url}\\n"
+    "Image: {image}\\n"
+    "Result: {res}\\n"
 ).format(
-    job=os.environ.get('JOB_NAME',''),
-    num=os.environ.get('BUILD_NUM',''),
-    url=os.environ.get('BUILD_URL',''),
-    image=os.environ.get('IMAGE_NAME',''),
-    res=os.environ.get('RESULT','')
+    job=os.environ.get("JOB_NAME",""),
+    num=os.environ.get("BUILD_NUM",""),
+    url=os.environ.get("BUILD_URL",""),
+    image=os.environ.get("IMAGE_NAME",""),
+    res=os.environ.get("RESULT","")
 )
 
 msg = EmailMessage()
-msg['To'] = to
-msg['From'] = email.utils.formataddr((from_name, user))
-msg['Subject'] = subject
+msg["To"] = to
+msg["From"] = email.utils.formataddr((from_name, user))
+msg["Subject"] = subject
 msg.set_content(body)
 
 for path in [
-    'reports/{image}.html'.format(image=os.environ.get('IMAGE_NAME','myapp')),
-    'reports/{image}.filtered.json'.format(image=os.environ.get('IMAGE_NAME','myapp')),
-    'reports/{image}.json'.format(image=os.environ.get('IMAGE_NAME','myapp'))
+    "reports/{image}.html".format(image=os.environ.get("IMAGE_NAME","myapp")),
+    "reports/{image}.filtered.json".format(image=os.environ.get("IMAGE_NAME","myapp")),
+    "reports/{image}.json".format(image=os.environ.get("IMAGE_NAME","myapp")),
 ]:
     if os.path.exists(path):
         ctype, _ = mimetypes.guess_type(path)
-        maintype, subtype = (ctype or 'application/octet-stream').split('/', 1)
-        with open(path, 'rb') as f:
+        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+        with open(path, "rb") as f:
             msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
 
 ctx = ssl.create_default_context()
-with smtplib.SMTP_SSL(os.environ.get('SMTP_HOST','smtp.gmail.com'), int(os.environ.get('SMTP_PORT','465')), context=ctx) as s:
+with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST","smtp.gmail.com"), int(os.environ.get("SMTP_PORT","465")), context=ctx) as s:
     s.login(user, pwd)
     s.send_message(msg)
-print('Email sent to', to)
+print("Email sent to", to)
 PY
-
-          RESULT='${"${currentBuild.currentResult}"}'
-          docker run --rm \
-            -e GMAIL_USER='${env.GMAIL_USER}' \
-            -e GMAIL_APP_PASSWORD='${env.GMAIL_APP_PASSWORD}' \
-            -e EMAIL_TO='${env.EMAIL_TO}' \
-            -e EMAIL_FROM_NAME='${env.EMAIL_FROM_NAME}' \
-            -e SMTP_HOST='smtp.gmail.com' \
-            -e SMTP_PORT='465' \
-            -e RESULT='\$RESULT' \
-            -e JOB_NAME='${env.JOB_NAME}' \
-            -e BUILD_NUM='${env.BUILD_NUMBER}' \
-            -e BUILD_URL='${env.BUILD_URL}' \
-            -e IMAGE_NAME='${env.IMAGE_NAME}' \
-            -v '${env.WORKSPACE}:/work' -v /tmp/send_email.py:/send_email.py \
-            -w /work python:3.11-slim python /send_email.py || true
-        "
-      """
+      ' ''')
     }
   }
 }
