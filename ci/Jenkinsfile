@@ -1,23 +1,18 @@
 pipeline {
   agent any
-
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-    skipDefaultCheckout(false)           // we'll use the workspace directly
     timeout(time: 60, unit: 'MINUTES')
   }
 
   parameters {
-    string(name: 'IMAGE_NAME', defaultValue: 'myapp',              description: 'Docker image name to build & scan')
+    string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
     string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',      description: 'Fail gate on these severities')
-    string(name: 'REPO_URL',   defaultValue: 'https://github.com/jay7848/vuln-scanner-pipeline.git', description: 'Git repo URL (not used for build when workspace present)')
-    string(name: 'REPO_REF',   defaultValue: 'main',               description: 'Branch / ref (informational)')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
   }
 
   environment {
-    DOCKER_BUILDKIT = '0'   // allow legacy builder
+    DOCKER_BUILDKIT = '0'   // keep legacy builder for simplicity
   }
 
   stages {
@@ -26,29 +21,32 @@ pipeline {
       steps {
         sh '''
           set -e
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "ERROR: docker CLI not found in Jenkins container (exit 127)."
-            echo "Install Docker CLI (see README) or re-run Jenkins with /usr/bin/docker bind-mounted."
-            exit 127
-          fi
+          command -v docker >/dev/null
           docker version
           echo "✅ Docker reachable"
         '''
       }
     }
 
+    stage('Resolve repo info') {
+      steps {
+        script {
+          env.REPO_URL = sh(returnStdout: true, script: 'git -C "$WORKSPACE" config --get remote.origin.url').trim()
+          env.REPO_SHA = sh(returnStdout: true, script: 'git -C "$WORKSPACE" rev-parse HEAD').trim()
+          echo "Using REPO_URL=${env.REPO_URL}"
+          echo "Using REPO_SHA=${env.REPO_SHA}"
+        }
+      }
+    }
+
     stage('Build image from workspace') {
       steps {
-        sh """
+        sh '''
           set -e
-          echo "Building ${params.IMAGE_NAME}:${BUILD_NUMBER} from workspace at ${env.WORKSPACE}"
-          DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker build --pull \
-            -f "${params.DOCKERFILE}" \
-            -t "${params.IMAGE_NAME}:${BUILD_NUMBER}" \
-            "${env.WORKSPACE}"
-
-          docker images --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\\t{{.Size}}' | grep -E '^${params.IMAGE_NAME}\\s+${BUILD_NUMBER}\\b'
-        """
+          echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from workspace at ${WORKSPACE}"
+          DOCKER_BUILDKIT=0 docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" "${WORKSPACE}"
+          docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}' | grep -E "^${IMAGE_NAME}[[:space:]]+${BUILD_NUMBER}\\b"
+        '''
       }
     }
 
@@ -65,42 +63,101 @@ pipeline {
 
     stage('Scan & Generate Report') {
       steps {
-        sh """
+        sh '''
           set -e
-          # Run scanner in a Python container against the workspace (no git clone)
-          docker run --rm -v "\$PWD":/app -w /app python:3.11-slim sh -lc '
-            set -eu
-            python -V
-            pip install --no-cache-dir -r requirements.txt
-            mkdir -p reports
-            python -m scanner.scan   "${params.IMAGE_NAME}:${BUILD_NUMBER}" "reports/${params.IMAGE_NAME}.json"
-            python -m scanner.report "reports/${params.IMAGE_NAME}.filtered.json" "reports/${params.IMAGE_NAME}.html"
-          '
-          ls -la reports || true
-        """
+
+          CID=$(docker create --rm \
+            -e REPO_URL -e REPO_SHA \
+            -e IMAGE_NAME="${IMAGE_NAME}" -e BUILD_NUMBER="${BUILD_NUMBER}" \
+            python:3.11-slim bash -lc '
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+              git clone --no-tags --depth 1 "$REPO_URL" /app
+              cd /app
+              git fetch --depth 1 origin "$REPO_SHA" || true
+              git checkout -q "$REPO_SHA"
+
+              python -V
+              pip install --no-cache-dir -r requirements.txt
+
+              mkdir -p reports
+              python -m scanner.scan   "${IMAGE_NAME}:${BUILD_NUMBER}" "reports/${IMAGE_NAME}.json"
+              python -m scanner.report "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
+
+              tar -czf /reports.tgz -C /app reports
+            ')
+          docker start -a "$CID"
+
+          # copy artifacts out and unpack into workspace
+          docker cp "$CID:/reports.tgz" "$WORKSPACE/reports.tgz" || true
+          docker rm "$CID" >/dev/null 2>&1 || true
+
+          mkdir -p reports
+          tar -xzf reports.tgz
+          ls -la reports
+        '''
       }
     }
 
     stage('Email Gate (send & enforce threshold)') {
       steps {
-        sh """
+        sh '''
           set -e
+
+          # Defaults
+          GMAIL_USER=""
+          GMAIL_APP_PASSWORD=""
+          EMAIL_TO=""
+          EMAIL_FROM_NAME="Vuln Scanner"
+          SMTP_HOST="smtp.gmail.com"
+          SMTP_PORT="465"
+          SUBJECT_PREFIX="[VulnScan]"
+          SEVERITY_IN="${SEVERITY:-HIGH,CRITICAL}"
+
+          # Read from .env if present (values may contain spaces)
           if [ -f .env ]; then
-            echo "Using .env for email settings"
-          else
-            echo "WARNING: .env not found. Email may fail if vars are missing."
+            GMAIL_USER="$(awk -F= \'/^GMAIL_USER=/{sub(/^GMAIL_USER=/,"");print}\' .env || true)"
+            GMAIL_APP_PASSWORD="$(awk -F= \'/^GMAIL_APP_PASSWORD=/{sub(/^GMAIL_APP_PASSWORD=/,"");print}\' .env || true)"
+            EMAIL_TO="$(awk -F= \'/^EMAIL_TO=/{sub(/^EMAIL_TO=/,"");print}\' .env || true)"
+            EMAIL_FROM_NAME="$(awk -F= \'/^EMAIL_FROM_NAME=/{sub(/^EMAIL_FROM_NAME=/,"");print}\' .env || true)"
+            SMTP_HOST="$(awk -F= \'/^SMTP_HOST=/{sub(/^SMTP_HOST=/,"");print}\' .env || true)"
+            SMTP_PORT="$(awk -F= \'/^SMTP_PORT=/{sub(/^SMTP_PORT=/,"");print}\' .env || true)"
+            SUBJECT_PREFIX="$(awk -F= \'/^SUBJECT_PREFIX=/{sub(/^SUBJECT_PREFIX=/,"");print}\' .env || true)"
+            SEVERITY_ENV="$(awk -F= \'/^SEVERITY=/{sub(/^SEVERITY=/,"");print}\' .env || true)"
+            if [ -n "$SEVERITY_ENV" ]; then SEVERITY_IN="$SEVERITY_ENV"; fi
           fi
 
-          docker run --rm -v "\$PWD":/app -w /app python:3.11-slim sh -lc '
-            set -eu
-            pip install --no-cache-dir -r requirements.txt
-            python -m scanner.notify_email \
-              --image       "${params.IMAGE_NAME}:${BUILD_NUMBER}" \
-              --report-json "reports/${params.IMAGE_NAME}.filtered.json" \
-              --report-html "reports/${params.IMAGE_NAME}.html" \
-              --fail-on     "${params.SEVERITY}"
-          '
-        """
+          if [ -z "$GMAIL_USER" ] || [ -z "$GMAIL_APP_PASSWORD" ] || [ -z "$EMAIL_TO" ]; then
+            echo "⚠️  Email not configured (.env missing GMAIL_USER/GMAIL_APP_PASSWORD/EMAIL_TO). Skipping email gate."
+            exit 0
+          fi
+
+          docker run --rm \
+            -e GMAIL_USER="$GMAIL_USER" \
+            -e GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD" \
+            -e EMAIL_TO="$EMAIL_TO" \
+            -e EMAIL_FROM_NAME="$EMAIL_FROM_NAME" \
+            -e SMTP_HOST="$SMTP_HOST" \
+            -e SMTP_PORT="$SMTP_PORT" \
+            -e SUBJECT_PREFIX="$SUBJECT_PREFIX" \
+            -e SEVERITY="$SEVERITY_IN" \
+            -v "$WORKSPACE":/out \
+            python:3.11-slim bash -lc "
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+              git clone --no-tags --depth 1 '$REPO_URL' /app
+              cd /app
+              git fetch --depth 1 origin '$REPO_SHA' || true
+              git checkout -q '$REPO_SHA'
+              pip install --no-cache-dir -r requirements.txt
+
+              python -m scanner.notify_email \
+                --image       '${IMAGE_NAME}:${BUILD_NUMBER}' \
+                --report-json '/out/reports/${IMAGE_NAME}.filtered.json' \
+                --report-html '/out/reports/${IMAGE_NAME}.html' \
+                --fail-on     '${SEVERITY_IN}'
+            "
+        '''
       }
     }
   }
@@ -108,41 +165,31 @@ pipeline {
   post {
     always {
       archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
-    }
-
-    success {
-      // Slack via webhook from .env (optional)
-      sh '''set -e
-        SLACK_WEBHOOK=""
-        if [ -f .env ]; then
-          SLACK_WEBHOOK=$(awk -F= \'/^SLACK_WEBHOOK=/{sub(/^SLACK_WEBHOOK=/,""); print}\' .env)
-        fi
-        if [ -n "${SLACK_WEBHOOK:-}" ]; then
-          docker run --rm curlimages/curl:8.10.1 \
-            -sS -X POST -H 'Content-type: application/json' \
-            --data "{\\"text\\": \\"✅ *${JOB_NAME}* #${BUILD_NUMBER} succeeded. <${BUILD_URL}|Open build>. Report: <${BUILD_URL}artifact/reports/${IMAGE_NAME}.html|HTML>\\"}" \
-            "$SLACK_WEBHOOK" || true
-        else
-          echo "No SLACK_WEBHOOK configured; skipping Slack notification."
-        fi
-      '''
-    }
-
-    failure {
-      sh '''set -e
-        SLACK_WEBHOOK=""
-        if [ -f .env ]; then
-          SLACK_WEBHOOK=$(awk -F= \'/^SLACK_WEBHOOK=/{sub(/^SLACK_WEBHOOK=/,""); print}\' .env)
-        fi
-        if [ -n "${SLACK_WEBHOOK:-}" ]; then
-          docker run --rm curlimages/curl:8.10.1 \
-            -sS -X POST -H 'Content-type: application/json' \
-            --data "{\\"text\\": \\"🚨 *${JOB_NAME}* #${BUILD_NUMBER} FAILED. <${BUILD_URL}|Open build>.\\"}" \
-            "$SLACK_WEBHOOK" || true
-        else
-          echo "No SLACK_WEBHOOK configured; skipping Slack notification."
-        fi
-      '''
+      script {
+        sh '''
+          set -e
+          # Optional Slack webhook notification (best-effort, never fails the build)
+          SLACK_WEBHOOK=""
+          if [ -f .env ]; then
+            SLACK_WEBHOOK="$(awk -F= \'/^SLACK_WEBHOOK=/{sub(/^SLACK_WEBHOOK=/,"");print}\' .env || true)"
+          fi
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            STATUS="SUCCESS"
+            [ "$currentBuild" != "SUCCESS" ] && STATUS="FAILED"
+            if [ "${currentBuild.currentResult}" != "SUCCESS" ]; then
+              MSG=":rotating_light: *${JOB_NAME}* #${BUILD_NUMBER} FAILED. <${BUILD_URL}|Open build>."
+            else
+              MSG=":white_check_mark: *${JOB_NAME}* #${BUILD_NUMBER} SUCCEEDED. <${BUILD_URL}|Open build>."
+            fi
+            docker run --rm curlimages/curl:8.10.1 -sS \
+              -X POST -H 'Content-type: application/json' \
+              --data "{\"text\": \"${MSG}\"}" \
+              "$SLACK_WEBHOOK" || true
+          else
+            echo "Slack webhook not set; skipping Slack notification."
+          fi
+        '''
+      }
     }
   }
 }
