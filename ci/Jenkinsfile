@@ -5,7 +5,7 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     disableConcurrentBuilds()
-    skipDefaultCheckout(true)   // we do checkout in our own stage
+    skipDefaultCheckout(true) // we do our own checkout
   }
 
   parameters {
@@ -20,10 +20,10 @@ pipeline {
 
   environment {
     PYTHONUNBUFFERED = '1'
-    DOCKER_BUILDKIT  = '1'                          // global; we override to 0 for git-context builds
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375'  // Docker Desktop TCP (adjust if needed)
+    DOCKER_BUILDKIT  = '1'
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375'  // adjust if different
     TRIVY_TAG        = 'latest'
-    CACHE_VOLUME     = 'trivy-cache'                // Docker volume to persist Trivy DBs
+    CACHE_VOLUME     = 'trivy-cache'
     REPORT_DIR       = 'reports'
   }
 
@@ -36,7 +36,6 @@ pipeline {
 
     stage('Sanity: Docker TCP') {
       steps {
-        // keep it POSIX; explicit shebang for bash features later
         sh '''#!/usr/bin/env bash
 set -Eeuo pipefail
 echo "Using DOCKER_HOST=${DOCKER_HOST}"
@@ -61,7 +60,6 @@ fi
 
           def ref = params.REPO_REF?.trim()
           if (!ref) {
-            // Jenkins checks out detached HEAD; allow HEAD which works for docker build contexts
             ref = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' rev-parse --abbrev-ref HEAD || echo HEAD").trim()
             if (!ref) { ref = 'HEAD' }
           }
@@ -76,9 +74,7 @@ fi
       steps {
         sh '''#!/usr/bin/env bash
 set -Eeuo pipefail
-
 echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-# Use classic builder for git URL contexts
 DOCKER_BUILDKIT=0 docker -H "${DOCKER_HOST}" build \
   --pull \
   -f "${DOCKERFILE}" \
@@ -99,12 +95,13 @@ docker -H "${DOCKER_HOST}" images | grep -E "^${IMAGE_NAME}\\s+${BUILD_NUMBER}\\
 set -Eeuo pipefail
 docker -H "${DOCKER_HOST}" volume create "${CACHE_VOLUME}" >/dev/null
 
-# Pull main vuln DB (and Java DB if full scan requested)
+# Main vuln DB
 docker -H "${DOCKER_HOST}" run --rm \
   -v "${CACHE_VOLUME}:/root/.cache/trivy" \
   "aquasec/trivy:${TRIVY_TAG}" --download-db-only || true
 
-if [[ "${SCAN_MODE}" == "full" ]]; then
+# Java (for language deps) if doing full scan
+if [[ "${SCAN_MODE:-os}" == "full" ]]; then
   docker -H "${DOCKER_HOST}" run --rm \
     -v "${CACHE_VOLUME}:/root/.cache/trivy" \
     "aquasec/trivy:${TRIVY_TAG}" --download-java-db-only || true
@@ -118,13 +115,22 @@ fi
         sh '''#!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Defensive defaults so -u never trips on unset
+: "${SECRET_SCAN:=false}"
+: "${SCAN_MODE:=os}"
+: "${SEVERITY:=HIGH,CRITICAL}"
+: "${IMAGE_NAME:?IMAGE_NAME missing}"
+: "${BUILD_NUMBER:?BUILD_NUMBER missing}"
+: "${REPORT_DIR:=reports}"
+: "${TRIVY_TAG:=latest}"
+: "${CACHE_VOLUME:=trivy-cache}"
+
 mkdir -p "${REPORT_DIR}"
 docker -H "${DOCKER_HOST}" volume create "${CACHE_VOLUME}" >/dev/null
 
 SCANNERS="vuln"
 [[ "${SECRET_SCAN}" == "true" ]] && SCANNERS="vuln,secret"
 
-# os mode avoids language DBs; full includes OS+library
 if [[ "${SCAN_MODE}" == "os" ]]; then
   VULN_TYPE="os"
 else
@@ -135,37 +141,51 @@ OUT_JSON="${IMAGE_NAME}.json"
 OUT_HTML="${IMAGE_NAME}.html"
 GATE_CODE="gate.code"
 
-# To avoid host-path mounts with remote DOCKER_HOST, we create a container, then docker cp the outputs.
-CMD=$'/bin/sh -lc \'set -e; mkdir -p /out; ' \
-'ec=0; trivy image ' \
-'--timeout 10m ' \
-'--scanners '"${SCANNERS}"' ' \
-'--vuln-type '"${VULN_TYPE}"' ' \
-'--severity "'"${SEVERITY}"'" ' \
-'--format json -o /out/'"${OUT_JSON}"' ' \
-'--exit-code 1 ' \
-'"${IMAGE_NAME}:${BUILD_NUMBER}"' \
-' || ec=$?; echo $ec >/out/'"${GATE_CODE}"'; ' \
-# Optional pretty HTML (fresh scan; fast with cache)
-'trivy image --timeout 10m --scanners '"${SCANNERS}"' --vuln-type '"${VULN_TYPE}"' --severity "'"${SEVERITY}"'" ' \
-'--format template --template "@/contrib/html.tpl" -o /out/'"${OUT_HTML}"' ' \
-'"${IMAGE_NAME}:${BUILD_NUMBER}"' ' \
-'\''
+# Save the built image from the remote daemon to a local tar (no socket mount needed)
+IMG_TAR="${WORKSPACE}/image.tar"
+rm -f "${IMG_TAR}"
+echo "Saving image ${IMAGE_NAME}:${BUILD_NUMBER} -> ${IMG_TAR}"
+docker -H "${DOCKER_HOST}" save -o "${IMG_TAR}" "${IMAGE_NAME}:${BUILD_NUMBER}"
 
-CID=$(docker -H "${DOCKER_HOST}" create --name "trivy-${BUILD_TAG//[[:^alnum:]]/-}" \
+# Create Trivy container on the remote daemon
+CID=$(docker -H "${DOCKER_HOST}" create \
   -v "${CACHE_VOLUME}:/root/.cache/trivy" \
   --entrypoint /bin/sh \
-  "aquasec/trivy:${TRIVY_TAG}" -lc "${CMD}"
-)
+  "aquasec/trivy:${TRIVY_TAG}" -lc 'sleep infinity')
 
-# Run the scan
-docker -H "${DOCKER_HOST}" start -a "$CID"
+# Copy the image tar into the container
+docker -H "${DOCKER_HOST}" cp "${IMG_TAR}" "$CID:/image.tar"
 
-# Copy artifacts out
+# Run scans inside the container
+docker -H "${DOCKER_HOST}" exec "$CID" /bin/sh -lc '
+set -e
+mkdir -p /out
+ec=0
+trivy image \
+  --timeout 10m \
+  --scanners '"${SCANNERS}"' \
+  --vuln-type '"${VULN_TYPE}"' \
+  --severity "'"${SEVERITY}"'" \
+  --format json -o /out/'"${OUT_JSON}"' \
+  --exit-code 1 \
+  --input /image.tar || ec=$?
+echo $ec >/out/'"${GATE_CODE}"'
+
+# HTML report (best-effort; fall back to table if template path ever changes)
+if [ -f /contrib/html.tpl ]; then
+  trivy image --timeout 10m --scanners '"${SCANNERS}"' --vuln-type '"${VULN_TYPE}"' --severity "'"${SEVERITY}"'" \
+    --format template --template "@/contrib/html.tpl" -o /out/'"${OUT_HTML}"' \
+    --input /image.tar || true
+else
+  trivy image --timeout 10m --scanners '"${SCANNERS}"' --vuln-type '"${VULN_TYPE}"' --severity "'"${SEVERITY}"'" \
+    --format table > /out/'"${OUT_HTML}"' || true
+fi
+'
+
+# Copy artifacts out and clean up
 docker -H "${DOCKER_HOST}" cp "$CID:/out/." "${REPORT_DIR}/"
-
-# Clean up container
-docker -H "${DOCKER_HOST}" rm "$CID" >/dev/null 2>&1 || true
+docker -H "${DOCKER_HOST}" rm -f "$CID" >/dev/null 2>&1 || true
+rm -f "${IMG_TAR}"
 
 echo "Reports written to ${REPORT_DIR}/${OUT_JSON} and ${REPORT_DIR}/${OUT_HTML}"
 '''
@@ -175,7 +195,6 @@ echo "Reports written to ${REPORT_DIR}/${OUT_JSON} and ${REPORT_DIR}/${OUT_HTML}
     stage('Gate (fail on severity)') {
       steps {
         script {
-          // Read the exit code Trivy produced (0 = pass, 1 = fail for selected severities)
           def code = sh(returnStdout: true, script: "cat '${env.REPORT_DIR}/gate.code' 2>/dev/null || echo 0").trim()
           echo "Trivy gate exit code: ${code}"
           if (code == '1') {
@@ -190,8 +209,7 @@ echo "Reports written to ${REPORT_DIR}/${OUT_JSON} and ${REPORT_DIR}/${OUT_HTML}
   post {
     always {
       archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
-      // Optionally keep workspace tidy
-      // cleanWs()
+      // cleanWs() // uncomment if you want to wipe workspace
     }
   }
 }
