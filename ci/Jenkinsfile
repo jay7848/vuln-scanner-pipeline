@@ -3,7 +3,6 @@ pipeline {
 
   options {
     timestamps()
-    ansiColor('xterm')
   }
 
   // Optional: auto-trigger on GitHub push (requires GH webhook + Jenkins GitHub plugin)
