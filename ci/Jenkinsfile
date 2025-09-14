@@ -1,13 +1,11 @@
+// Jenkinsfile - vuln-scanner-pipeline (plugin-light, webhook Slack)
+
 pipeline {
   agent any
 
   options {
     timestamps()
-  }
-
-  // Optional: auto-trigger on GitHub push (requires GH webhook + Jenkins GitHub plugin)
-  triggers {
-    githubPush()
+    // ansiColor('xterm') // <- leave commented unless the AnsiColor plugin is installed
   }
 
   parameters {
@@ -16,16 +14,14 @@ pipeline {
     string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL',      description: 'Fail gate on these severities')
     string(name: 'REPO_URL',   defaultValue: '',                   description: 'Git repo URL (blank = autodetect)')
     string(name: 'REPO_REF',   defaultValue: '',                   description: 'Branch/ref (blank = autodetect)')
-    booleanParam(name: 'WARM_TRIVY_DB', defaultValue: true,        description: 'Pre-pull Trivy DB (faster scans after first run)')
-    booleanParam(name: 'ENABLE_SLACK',  defaultValue: true,        description: 'Send Slack notifications from Jenkins')
-    string(name: 'SLACK_CHANNEL', defaultValue: '#jenkins',        description: 'Slack channel (requires Slack plugin config)')
+    booleanParam(name: 'WARM_TRIVY_DB', defaultValue: true,        description: 'Pre-pull Trivy DB (faster after first run)')
+    booleanParam(name: 'ENABLE_SLACK',  defaultValue: true,        description: 'Notify Slack via webhook (no plugin needed)')
+    string(name: 'SLACK_WEBHOOK_CREDENTIAL_ID', defaultValue: '',  description: 'Secret Text cred id holding Slack Incoming Webhook URL')
   }
 
   environment {
-    // Using Docker Desktop via TCP (WSL2/Windows/Mac). Change if your daemon differs.
-    DOCKER_HOST     = 'tcp://host.docker.internal:2375'
-    // Use legacy builder so we can build directly from a remote git URL without buildx.
-    DOCKER_BUILDKIT = '0'
+    DOCKER_HOST     = 'tcp://host.docker.internal:2375' // adjust if your daemon differs
+    DOCKER_BUILDKIT = '0'                                // legacy builder so remote git build works
     LANG            = 'C.UTF-8'
   }
 
@@ -51,28 +47,17 @@ pipeline {
     stage('Resolve repo (autodetect if blanks)') {
       steps {
         script {
-          // URL
-          if (!params.REPO_URL?.trim()) {
-            env.REPO_URL = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' config --get remote.origin.url").trim()
-          } else {
-            env.REPO_URL = params.REPO_URL.trim()
-          }
+          env.REPO_URL = (params.REPO_URL?.trim())
+              ?: sh(script: "git -C '${env.WORKSPACE}' config --get remote.origin.url", returnStdout: true).trim()
 
-          // Branch/ref: try to find a branch name; fallback to HEAD
           def ref = params.REPO_REF?.trim()
           if (!ref) {
             ref = sh(
-              returnStdout: true,
-              script: """
-                set -e
-                cd '${env.WORKSPACE}'
-                # Prefer branch name if available; otherwise use HEAD
-                git symbolic-ref --short -q HEAD || echo HEAD
-              """
+              script: "cd '${env.WORKSPACE}'; git symbolic-ref --short -q HEAD || echo HEAD",
+              returnStdout: true
             ).trim()
           }
           env.REPO_REF = ref
-
           echo "Using REPO_URL=${env.REPO_URL}, REPO_REF=${env.REPO_REF}"
         }
       }
@@ -83,12 +68,7 @@ pipeline {
         sh '''
           set -e
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-          DOCKER_BUILDKIT=0 docker build \
-            --pull \
-            -f "${DOCKERFILE}" \
-            -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
-            "${REPO_URL}#${REPO_REF}"
-
+          DOCKER_BUILDKIT=0 docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" "${REPO_URL}#${REPO_REF}"
           docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}" | grep "^${IMAGE_NAME}\\s\\+${BUILD_NUMBER}\\b" || true
         '''
       }
@@ -97,42 +77,39 @@ pipeline {
     stage('Warm Trivy DB cache (conditional)') {
       when { expression { return params.WARM_TRIVY_DB } }
       steps {
-        // Pull the Trivy DB and Java DB OCI images so later scans don't re-download ~800MB.
         sh '''
           set -e
-          echo "Pre-pulling Trivy DB images (one-time per Docker daemon cache)..."
-          docker pull ghcr.io/aquasecurity/trivy-db:2       || true
-          docker pull ghcr.io/aquasecurity/trivy-java-db:1  || true
+          echo "Pre-pulling Trivy DB images (best effort; safe to skip on network hiccups)..."
+          docker pull ghcr.io/aquasecurity/trivy-db:2      || true
+          docker pull ghcr.io/aquasecurity/trivy-java-db:1 || true
         '''
       }
     }
 
     stage('Scan & Generate Report') {
       steps {
-        // Run scanner entirely inside python:3.11-slim, no host mounts.
-        // (Avoid -u in set flags so unset vars don't fail the step.)
         sh '''
-          set -eo pipefail
+          set -e
 
-          docker run --rm -e DOCKER_HOST python:3.11-slim bash -lc "
+          # Create a container that will scan + package /reports.tgz, then copy it out.
+          CID=$(docker create --rm -e DOCKER_HOST python:3.11-slim bash -lc '
             set -e
-            apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
-            git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
+            apt-get update -qq && apt-get install -y -qq git ca-certificates && rm -rf /var/lib/apt/lists/*
+            git clone --branch "'"${REPO_REF}"'" --depth 1 "'"${REPO_URL}"'" /app
             cd /app
             pip install --no-cache-dir -r requirements.txt
             mkdir -p reports
-            python -m scanner.scan '${IMAGE_NAME}:${BUILD_NUMBER}' 'reports/${IMAGE_NAME}.json'
-            python -m scanner.report 'reports/${IMAGE_NAME}.filtered.json' 'reports/${IMAGE_NAME}.html'
+            python -m scanner.scan "'"${IMAGE_NAME}:${BUILD_NUMBER}"'" "reports/'"${IMAGE_NAME}"'.json"
+            python -m scanner.report "reports/'"${IMAGE_NAME}"'.filtered.json" "reports/'"${IMAGE_NAME}"'.html"
             tar -czf /reports.tgz -C /app reports
-          "
+          ')
 
-          # Extract the tarball from a throwaway container (no host mount needed)
-          CID=$(docker create --rm python:3.11-slim)
-          docker cp "$CID:/reports.tgz" ./reports.tgz || true
+          docker start -a "$CID"
+          docker cp "$CID:/reports.tgz" ./reports.tgz
           docker rm "$CID" >/dev/null 2>&1 || true
 
           mkdir -p reports
-          tar -xzf reports.tgz -C . 2>/dev/null || true
+          tar -xzf reports.tgz
           echo "Report files:"
           ls -la reports || true
         '''
@@ -147,15 +124,14 @@ pipeline {
           string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
           sh '''
-            set -eo pipefail
-            # Use python container to send email, and fail the build if threshold is exceeded
+            set -e
             docker run --rm \
               -e DOCKER_HOST \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
               -v "$PWD":/out:ro \
               python:3.11-slim bash -lc "
                 set -e
-                apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+                apt-get update -qq && apt-get install -y -qq git ca-certificates && rm -rf /var/lib/apt/lists/*
                 git clone --branch '${REPO_REF}' --depth 1 '${REPO_URL}' /app
                 cd /app
                 pip install --no-cache-dir -r requirements.txt
@@ -175,28 +151,40 @@ pipeline {
     always {
       archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true, onlyIfSuccessful: false
     }
+
     success {
       script {
-        if (params.ENABLE_SLACK) {
-          try {
-            slackSend channel: params.SLACK_CHANNEL,
-                      color: 'good',
-                      message: "✅ *${env.JOB_NAME}* #${env.BUILD_NUMBER} succeeded\n• Image: `${params.IMAGE_NAME}:${env.BUILD_NUMBER}`\n• Repo: ${env.REPO_URL ?: env.REPO_URL}\n• Ref: ${env.REPO_REF ?: 'HEAD'}"
-          } catch (err) {
-            echo "Slack (success) skipped: ${err}"
+        if (params.ENABLE_SLACK && params.SLACK_WEBHOOK_CREDENTIAL_ID?.trim()) {
+          withCredentials([string(credentialsId: params.SLACK_WEBHOOK_CREDENTIAL_ID, variable: 'SLACK_WEBHOOK_URL')]) {
+            sh '''
+              set -e
+              MSG=$(cat <<EOF
+{
+  "text": "✅ ${JOB_NAME} #${BUILD_NUMBER} succeeded\\n• Image: \`${IMAGE_NAME}:${BUILD_NUMBER}\`\\n• Repo: ${REPO_URL}\\n• Ref: ${REPO_REF}\\n• ${BUILD_URL}"
+}
+EOF
+)
+              docker run --rm -i curlimages/curl -sS -X POST -H 'Content-type: application/json' --data "$MSG" "$SLACK_WEBHOOK_URL" || true
+            '''
           }
         }
       }
     }
+
     failure {
       script {
-        if (params.ENABLE_SLACK) {
-          try {
-            slackSend channel: params.SLACK_CHANNEL,
-                      color: 'danger',
-                      message: "❌ *${env.JOB_NAME}* #${env.BUILD_NUMBER} failed\n• Image: `${params.IMAGE_NAME}:${env.BUILD_NUMBER}`\nCheck console output for details."
-          } catch (err) {
-            echo "Slack (failure) skipped: ${err}"
+        if (params.ENABLE_SLACK && params.SLACK_WEBHOOK_CREDENTIAL_ID?.trim()) {
+          withCredentials([string(credentialsId: params.SLACK_WEBHOOK_CREDENTIAL_ID, variable: 'SLACK_WEBHOOK_URL')]) {
+            sh '''
+              set -e
+              MSG=$(cat <<EOF
+{
+  "text": "❌ ${JOB_NAME} #${BUILD_NUMBER} failed\\n• Image: \`${IMAGE_NAME}:${BUILD_NUMBER}\`\\n• ${BUILD_URL}"
+}
+EOF
+)
+              docker run --rm -i curlimages/curl -sS -X POST -H 'Content-type: application/json' --data "$MSG" "$SLACK_WEBHOOK_URL" || true
+            '''
           }
         }
       }
