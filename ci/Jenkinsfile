@@ -1,12 +1,13 @@
 pipeline {
   agent any
   options {
+    ansiColor('xterm')
     timestamps()
     timeout(time: 60, unit: 'MINUTES')
   }
 
   environment {
-    SEVERITY  = "HIGH,CRITICAL"
+    SEVERITY   = "HIGH,CRITICAL"
     IMAGE_NAME = "demo-app"
     IMAGE_TAG  = "dev"
     DOCKERFILE = "DemoApp.Dockerfile"
@@ -42,7 +43,7 @@ pipeline {
 
     stage('Scan & Generate Report') {
       steps {
-        // 1) Trivy (dockerized) → raw JSON
+        // 1) Trivy (dockerized) → raw JSON (non-fatal if it finds vulns)
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
@@ -58,6 +59,7 @@ pipeline {
         '''
 
         // 2) Python wrappers (inside container) → filtered JSON + HTML
+        //    Auto-detect the folder that actually contains scanner/scan.py
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
@@ -68,6 +70,21 @@ pipeline {
               set -Eeuo pipefail
               python -V
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+
+              shopt -s globstar nullglob
+              APPDIR="/work"
+              if [ ! -f "/work/scanner/scan.py" ]; then
+                CAND=(/work/**/scanner/scan.py)
+                if [ ${#CAND[@]} -gt 0 ]; then
+                  APPDIR="$(dirname "$(dirname "${CAND[0]}")")"
+                else
+                  echo "ERROR: scanner/scan.py not found anywhere under /work"; exit 2
+                fi
+              fi
+              echo "Using APPDIR: $APPDIR"
+              cd "$APPDIR"
+
+              mkdir -p reports
               python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
               python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
               ls -al reports
@@ -94,11 +111,25 @@ pipeline {
               python:3.11-slim bash -lc "
                 set -Eeuo pipefail
                 [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-                python scanner/notify_email.py \
-                  --image       \\"${IMAGE_NAME}:${IMAGE_TAG}\\" \
-                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \
-                  --report-html \\"reports/${IMAGE_NAME}.html\\" \
-                  --fail-on     \\"${SEVERITY}\\"
+
+                shopt -s globstar nullglob
+                APPDIR=/work
+                if [ ! -f /work/scanner/notify_email.py ]; then
+                  CAND=(/work/**/scanner/notify_email.py)
+                  if [ \${#CAND[@]} -gt 0 ]; then
+                    APPDIR=\\\"\\$(dirname \\\"\\$(dirname \\\"\\${CAND[0]}\\\" )\\\")\\\"
+                  else
+                    echo \\"ERROR: scanner/notify_email.py not found anywhere under /work\\"; exit 2
+                  fi
+                fi
+                echo \\"Using APPDIR: $APPDIR\\"
+                cd $APPDIR
+
+                python scanner/notify_email.py \\
+                  --image       \\\"${IMAGE_NAME}:${IMAGE_TAG}\\\" \\
+                  --report-json \\\"reports/${IMAGE_NAME}.filtered.json\\\" \\
+                  --report-html \\\"reports/${IMAGE_NAME}.html\\\" \\
+                  --fail-on     \\\"${SEVERITY}\\\"
               "
           '''
         }
