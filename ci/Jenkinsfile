@@ -9,7 +9,7 @@ pipeline {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
     string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
     string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
-    booleanParam(name: 'WARM_TRIVY_DB', defaultValue: false, description: 'Optional: pre-pull Trivy DB images (usually not needed now)')
+    booleanParam(name: 'WARM_TRIVY_DB', defaultValue: false, description: 'Optional: pre-pull Trivy DB images')
   }
 
   environment {
@@ -20,12 +20,12 @@ pipeline {
 
     stage('Docker availability') {
       steps {
-        sh '''
+        sh """
           set -e
           command -v docker >/dev/null
           docker version
           echo "✅ Docker reachable"
-        '''
+        """
       }
     }
 
@@ -42,34 +42,34 @@ pipeline {
 
     stage('Build image from workspace') {
       steps {
-        sh '''
+        sh """
           set -e
           echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from workspace at ${WORKSPACE}"
           DOCKER_BUILDKIT=0 docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${BUILD_NUMBER}" "${WORKSPACE}"
-          docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}' | grep -E "^${IMAGE_NAME}[[:space:]]+${BUILD_NUMBER}\\b"
-        '''
+          docker images --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\\t{{.Size}}' | grep -E "^${IMAGE_NAME}[[:space:]]+${BUILD_NUMBER}\\b"
+        """
       }
     }
 
     stage('Warm Trivy DB cache (optional)') {
       when { expression { return params.WARM_TRIVY_DB } }
       steps {
-        sh '''
+        sh """
           set -e
           echo "Pre-pulling Trivy DB images (safe to skip on failure)..."
           docker pull public.ecr.aws/aquasecurity/trivy-db:2 || true
           docker pull public.ecr.aws/aquasecurity/trivy-java-db:1 || true
-        '''
+        """
       }
     }
 
     stage('Scan & Generate Report') {
       steps {
-        sh '''
+        sh """
           set -e
 
-          # Run everything inside a light Python container; mount workspace and Docker socket.
-          CID=$(docker create --rm \
+          # Run scan in a light Python container; mount workspace and Docker socket.
+          CID=\$(docker create --rm \
             -e IMAGE_NAME="${IMAGE_NAME}" \
             -e BUILD_NUMBER="${BUILD_NUMBER}" \
             -e TRIVY_CACHE_DIR="/tmp/trivy-cache" \
@@ -84,7 +84,7 @@ pipeline {
               apt-get update -qq
               apt-get install -y -qq curl ca-certificates && rm -rf /var/lib/apt/lists/*
 
-              # Install Trivy (static binary) – no docker CLI/systemd bloat.
+              # Install Trivy (static binary)
               TRIVY_VER=0.52.2
               curl -fsSL -o /tmp/trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_Linux-64bit.tar.gz"
               tar -C /usr/local/bin -xzf /tmp/trivy.tgz trivy
@@ -94,32 +94,31 @@ pipeline {
               pip install --no-cache-dir -r requirements.txt
 
               mkdir -p reports
-
               # Pre-download DB from AWS Public ECR (more reliable than GHCR in some environments)
               trivy --download-db-only --no-progress || trivy --reset --download-db-only --no-progress
 
-              # Run the scanner (calls Trivy under the hood and expects JSON)
+              # Run the scanner (invokes Trivy under the hood)
               python -m scanner.scan   "${IMAGE_NAME}:${BUILD_NUMBER}" "reports/${IMAGE_NAME}.json"
               python -m scanner.report "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
 
               tar -czf /reports.tgz -C /app reports
             ')
-          docker start -a "$CID"
+          docker start -a "\$CID"
 
           # Copy artifacts out and unpack into workspace
-          docker cp "$CID:/reports.tgz" "$WORKSPACE/reports.tgz" || true
-          docker rm "$CID" >/dev/null 2>&1 || true
+          docker cp "\$CID:/reports.tgz" "$WORKSPACE/reports.tgz" || true
+          docker rm "\$CID" >/dev/null 2>&1 || true
 
           mkdir -p reports
           tar -xzf reports.tgz
           ls -la reports
-        '''
+        """
       }
     }
 
     stage('Email Gate (send & enforce threshold)') {
       steps {
-        sh '''
+        sh """
           set -e
 
           # Defaults
@@ -134,33 +133,33 @@ pipeline {
 
           # Read from .env if present
           if [ -f .env ]; then
-            GMAIL_USER="$(awk -F= \'/^GMAIL_USER=/{sub(/^GMAIL_USER=/,"");print}\' .env || true)"
-            GMAIL_APP_PASSWORD="$(awk -F= \'/^GMAIL_APP_PASSWORD=/{sub(/^GMAIL_APP_PASSWORD=/,"");print}\' .env || true)"
-            EMAIL_TO="$(awk -F= \'/^EMAIL_TO=/{sub(/^EMAIL_TO=/,"");print}\' .env || true)"
-            EMAIL_FROM_NAME="$(awk -F= \'/^EMAIL_FROM_NAME=/{sub(/^EMAIL_FROM_NAME=/,"");print}\' .env || true)"
-            SMTP_HOST="$(awk -F= \'/^SMTP_HOST=/{sub(/^SMTP_HOST=/,"");print}\' .env || true)"
-            SMTP_PORT="$(awk -F= \'/^SMTP_PORT=/{sub(/^SMTP_PORT=/,"");print}\' .env || true)"
-            SUBJECT_PREFIX="$(awk -F= \'/^SUBJECT_PREFIX=/{sub(/^SUBJECT_PREFIX=/,"");print}\' .env || true)"
-            SEVERITY_ENV="$(awk -F= \'/^SEVERITY=/{sub(/^SEVERITY=/,"");print}\' .env || true)"
-            if [ -n "$SEVERITY_ENV" ]; then SEVERITY_IN="$SEVERITY_ENV"; fi
+            GMAIL_USER="\$(awk -F= '/^GMAIL_USER=/{sub(/^GMAIL_USER=/,"");print}' .env || true)"
+            GMAIL_APP_PASSWORD="\$(awk -F= '/^GMAIL_APP_PASSWORD=/{sub(/^GMAIL_APP_PASSWORD=/,"");print}' .env || true)"
+            EMAIL_TO="\$(awk -F= '/^EMAIL_TO=/{sub(/^EMAIL_TO=/,"");print}' .env || true)"
+            EMAIL_FROM_NAME="\$(awk -F= '/^EMAIL_FROM_NAME=/{sub(/^EMAIL_FROM_NAME=/,"");print}' .env || true)"
+            SMTP_HOST="\$(awk -F= '/^SMTP_HOST=/{sub(/^SMTP_HOST=/,"");print}' .env || true)"
+            SMTP_PORT="\$(awk -F= '/^SMTP_PORT=/{sub(/^SMTP_PORT=/,"");print}' .env || true)"
+            SUBJECT_PREFIX="\$(awk -F= '/^SUBJECT_PREFIX=/{sub(/^SUBJECT_PREFIX=/,"");print}' .env || true)"
+            SEVERITY_ENV="\$(awk -F= '/^SEVERITY=/{sub(/^SEVERITY=/,"");print}' .env || true)"
+            [ -n "\$SEVERITY_ENV" ] && SEVERITY_IN="\$SEVERITY_ENV"
           fi
 
-          if [ -z "$GMAIL_USER" ] || [ -z "$GMAIL_APP_PASSWORD" ] || [ -z "$EMAIL_TO" ]; then
-            echo "⚠️  Email not configured (.env missing GMAIL_USER/GMAIL_APP_PASSWORD/EMAIL_TO). Skipping gate email."
+          # Only send the detailed gate email if scan produced the filtered report.
+          if [ -z "\$GMAIL_USER" ] || [ -z "\$GMAIL_APP_PASSWORD" ] || [ -z "\$EMAIL_TO" ]; then
+            echo "⚠️  Email gate: .env missing GMAIL_USER/GMAIL_APP_PASSWORD/EMAIL_TO. Skipping."
             exit 0
           fi
 
-          # Only run the full gate email if the detailed report exists (scan succeeded).
           if [ -f "reports/${IMAGE_NAME}.filtered.json" ] && [ -f "reports/${IMAGE_NAME}.html" ]; then
             docker run --rm \
-              -e GMAIL_USER="$GMAIL_USER" \
-              -e GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD" \
-              -e EMAIL_TO="$EMAIL_TO" \
-              -e EMAIL_FROM_NAME="$EMAIL_FROM_NAME" \
-              -e SMTP_HOST="$SMTP_HOST" \
-              -e SMTP_PORT="$SMTP_PORT" \
-              -e SUBJECT_PREFIX="$SUBJECT_PREFIX" \
-              -e SEVERITY="$SEVERITY_IN" \
+              -e GMAIL_USER="\$GMAIL_USER" \
+              -e GMAIL_APP_PASSWORD="\$GMAIL_APP_PASSWORD" \
+              -e EMAIL_TO="\$EMAIL_TO" \
+              -e EMAIL_FROM_NAME="\$EMAIL_FROM_NAME" \
+              -e SMTP_HOST="\$SMTP_HOST" \
+              -e SMTP_PORT="\$SMTP_PORT" \
+              -e SUBJECT_PREFIX="\$SUBJECT_PREFIX" \
+              -e SEVERITY="\$SEVERITY_IN" \
               -v "$WORKSPACE":/out \
               -v "$WORKSPACE":/app \
               -w /app \
@@ -171,12 +170,12 @@ pipeline {
                   --image       '${IMAGE_NAME}:${BUILD_NUMBER}' \
                   --report-json '/out/reports/${IMAGE_NAME}.filtered.json' \
                   --report-html '/out/reports/${IMAGE_NAME}.html' \
-                  --fail-on     '${SEVERITY_IN}'
+                  --fail-on     '\$SEVERITY_IN'
               "
           else
             echo "No detailed report available; skipping gate email."
           fi
-        '''
+        """
       }
     }
   }
@@ -185,7 +184,6 @@ pipeline {
     always {
       archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
       script {
-        // ALWAYS send a short status email (replaces Slack). Safe even if scan failed.
         def result = currentBuild.currentResult ?: 'UNKNOWN'
         sh """
           set -e
@@ -193,6 +191,7 @@ pipeline {
           JOB_NAME_ESC="${env.JOB_NAME}"
           BUILD_NUM="${env.BUILD_NUMBER}"
           BUILD_URL_ESC="${env.BUILD_URL}"
+          IMAGE_NAME="${params.IMAGE_NAME}"
 
           # Read mail settings
           GMAIL_USER=""
@@ -204,13 +203,13 @@ pipeline {
           SMTP_PORT="465"
 
           if [ -f .env ]; then
-            GMAIL_USER="\$(awk -F= '/^GMAIL_USER=/{sub(/^GMAIL_USER=/,"");print}' .env || true)"
-            GMAIL_APP_PASSWORD="\$(awk -F= '/^GMAIL_APP_PASSWORD=/{sub(/^GMAIL_APP_PASSWORD=/,"");print}' .env || true)"
-            EMAIL_TO="\$(awk -F= '/^EMAIL_TO=/{sub(/^EMAIL_TO=/,"");print}' .env || true)"
-            EMAIL_FROM_NAME="\$(awk -F= '/^EMAIL_FROM_NAME=/{sub(/^EMAIL_FROM_NAME=/,"");print}' .env || true)"
-            SUBJECT_PREFIX="\$(awk -F= '/^SUBJECT_PREFIX=/{sub(/^SUBJECT_PREFIX=/,"");print}' .env || true)"
-            SMTP_HOST="\$(awk -F= '/^SMTP_HOST=/{sub(/^SMTP_HOST=/,"");print}' .env || true)"
-            SMTP_PORT="\$(awk -F= '/^SMTP_PORT=/{sub(/^SMTP_PORT=/,"");print}' .env || true)"
+            GMAIL_USER=\$(awk -F= '/^GMAIL_USER=/{sub(/^GMAIL_USER=/,"");print}' .env || true)
+            GMAIL_APP_PASSWORD=\$(awk -F= '/^GMAIL_APP_PASSWORD=/{sub(/^GMAIL_APP_PASSWORD=/,"");print}' .env || true)
+            EMAIL_TO=\$(awk -F= '/^EMAIL_TO=/{sub(/^EMAIL_TO=/,"");print}' .env || true)
+            EMAIL_FROM_NAME=\$(awk -F= '/^EMAIL_FROM_NAME=/{sub(/^EMAIL_FROM_NAME=/,"");print}' .env || true)
+            SUBJECT_PREFIX=\$(awk -F= '/^SUBJECT_PREFIX=/{sub(/^SUBJECT_PREFIX=/,"");print}' .env || true)
+            SMTP_HOST=\$(awk -F= '/^SMTP_HOST=/{sub(/^SMTP_HOST=/,"");print}' .env || true)
+            SMTP_PORT=\$(awk -F= '/^SMTP_PORT=/{sub(/^SMTP_PORT=/,"");print}' .env || true)
           fi
 
           if [ -z "\$GMAIL_USER" ] || [ -z "\$GMAIL_APP_PASSWORD" ] || [ -z "\$EMAIL_TO" ]; then
@@ -230,11 +229,12 @@ pipeline {
             -e JOB_NAME="\$JOB_NAME_ESC" \
             -e BUILD_NUM="\$BUILD_NUM" \
             -e BUILD_URL="\$BUILD_URL_ESC" \
-            -e IMAGE_NAME="${IMAGE_NAME}" \
+            -e IMAGE_NAME="\$IMAGE_NAME" \
             -v "$WORKSPACE":/out \
             python:3.11-slim python - << 'PY'
-import os, ssl, smtplib, mimetypes
+import os, ssl, smtplib
 from email.message import EmailMessage
+
 user = os.environ["GMAIL_USER"]
 pwd  = os.environ["GMAIL_APP_PASSWORD"]
 to   = os.environ["EMAIL_TO"]
@@ -247,26 +247,28 @@ url = os.environ.get("BUILD_URL","")
 image = os.environ.get("IMAGE_NAME","image")
 smtp_host = os.environ.get("SMTP_HOST","smtp.gmail.com")
 smtp_port = int(os.environ.get("SMTP_PORT","465"))
+
 msg = EmailMessage()
 msg["From"] = f"{from_name} <{user}>"
 msg["To"] = to
 msg["Subject"] = f"{sub_prefix} {job} #{num} {status}"
-body = f"""{job} build #{num} {status}.
 
-Image: {image}:{num}
-Build URL: {url}
+lines = [
+    f"{job} build #{num} {status}.",
+    "",
+    f"Image: {image}:{num}",
+    f"Build URL: {url}",
+    "",
+    "This is an automated notification."
+]
+msg.set_content("\\n".join(lines))
 
-This is an automated notification."""
-msg.set_content(body)
-
-# Attach report HTML if exists
 html_path = f"/out/reports/{image}.html"
 if os.path.exists(html_path):
     with open(html_path, "rb") as f:
         data = f.read()
     msg.add_attachment(data, maintype="text", subtype="html", filename=f"{image}.html")
 
-# Send
 context = ssl.create_default_context()
 with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as s:
     s.login(user, pwd)
