@@ -1,54 +1,72 @@
 pipeline {
   agent any
-  options { timestamps() }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    skipDefaultCheckout(true)   // we do checkout in our own stage
+  }
 
   parameters {
     string(name: 'IMAGE_NAME', defaultValue: 'myapp', description: 'Docker image name to build & scan')
     string(name: 'DOCKERFILE', defaultValue: 'DemoApp.Dockerfile', description: 'Dockerfile path in repo')
-    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Fail gate on these severities')
+    string(name: 'SEVERITY',   defaultValue: 'HIGH,CRITICAL', description: 'Gate fails if these severities are found')
     string(name: 'REPO_URL',   defaultValue: '', description: 'Git repo URL (blank = autodetect)')
-    string(name: 'REPO_REF',   defaultValue: '', description: 'Git ref/branch (blank = autodetect)')
+    string(name: 'REPO_REF',   defaultValue: '', description: 'Git ref/branch/tag/sha (blank = autodetect)')
+    choice(name: 'SCAN_MODE',  choices: ['os','full'], description: 'os = only OS packages (fast). full = OS + language deps.')
+    booleanParam(name: 'SECRET_SCAN', defaultValue: false, description: 'Also run secret scanning (slower)')
   }
 
   environment {
     PYTHONUNBUFFERED = '1'
-    DOCKER_BUILDKIT  = '1'
-    // Docker Desktop / remote daemon over TCP
-    DOCKER_HOST      = 'tcp://host.docker.internal:2375'
+    DOCKER_BUILDKIT  = '1'                          // global; we override to 0 for git-context builds
+    DOCKER_HOST      = 'tcp://host.docker.internal:2375'  // Docker Desktop TCP (adjust if needed)
+    TRIVY_TAG        = 'latest'
+    CACHE_VOLUME     = 'trivy-cache'                // Docker volume to persist Trivy DBs
     REPORT_DIR       = 'reports'
-    TRIVY_TAG        = '0.53.0'
   }
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+      }
     }
 
     stage('Sanity: Docker TCP') {
       steps {
+        // keep it POSIX; explicit shebang for bash features later
         sh '''#!/usr/bin/env bash
-        set -Eeuo pipefail
-        echo "Using DOCKER_HOST=$DOCKER_HOST"
-        docker -H "$DOCKER_HOST" version >/dev/null
-        echo "✅ Docker reachable"
-        '''
+set -Eeuo pipefail
+echo "Using DOCKER_HOST=${DOCKER_HOST}"
+if docker -H "${DOCKER_HOST}" version >/dev/null 2>&1; then
+  echo "✅ Docker reachable"
+else
+  echo "❌ Docker NOT reachable at ${DOCKER_HOST}" >&2
+  exit 1
+fi
+'''
       }
     }
 
     stage('Resolve repo (autodetect if blanks)') {
       steps {
         script {
-          if (!params.REPO_URL?.trim()) {
-            env.REPO_URL = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' config --get remote.origin.url").trim()
-          } else {
-            env.REPO_URL = params.REPO_URL.trim()
+          def url = params.REPO_URL?.trim()
+          if (!url) {
+            url = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' config --get remote.origin.url").trim()
           }
-          if (!params.REPO_REF?.trim()) {
-            def ref = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' rev-parse --abbrev-ref HEAD || echo main").trim()
-            env.REPO_REF = ref ?: 'main'
-          } else {
-            env.REPO_REF = params.REPO_REF.trim()
+          env.REPO_URL = url
+
+          def ref = params.REPO_REF?.trim()
+          if (!ref) {
+            // Jenkins checks out detached HEAD; allow HEAD which works for docker build contexts
+            ref = sh(returnStdout: true, script: "git -C '${env.WORKSPACE}' rev-parse --abbrev-ref HEAD || echo HEAD").trim()
+            if (!ref) { ref = 'HEAD' }
           }
+          env.REPO_REF = ref
+
           echo "Using REPO_URL=${env.REPO_URL}, REPO_REF=${env.REPO_REF}"
         }
       }
@@ -57,73 +75,113 @@ pipeline {
     stage('Build image from Git (no mounts)') {
       steps {
         sh '''#!/usr/bin/env bash
-        set -Eeuo pipefail
-        mkdir -p "${REPORT_DIR}"
-        echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
-        DOCKER_BUILDKIT=0 docker -H "$DOCKER_HOST" build \
-          --pull \
-          -f "${DOCKERFILE}" \
-          -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
-          "${REPO_URL}#${REPO_REF}"
-        docker -H "$DOCKER_HOST" image ls "${IMAGE_NAME}"
-        '''
+set -Eeuo pipefail
+
+echo "Building ${IMAGE_NAME}:${BUILD_NUMBER} from ${REPO_URL}#${REPO_REF}"
+# Use classic builder for git URL contexts
+DOCKER_BUILDKIT=0 docker -H "${DOCKER_HOST}" build \
+  --pull \
+  -f "${DOCKERFILE}" \
+  -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
+  "${REPO_URL}#${REPO_REF}"
+
+docker -H "${DOCKER_HOST}" images | grep -E "^${IMAGE_NAME}\\s+${BUILD_NUMBER}\\b" || true
+'''
       }
     }
 
-    stage('Scan & Generate Report (no mounts)') {
+    stage('Warm Trivy DB cache (conditional)') {
+      when {
+        expression { params.SCAN_MODE == 'full' || params.SECRET_SCAN }
+      }
       steps {
         sh '''#!/usr/bin/env bash
-        set -Eeuo pipefail
-        mkdir -p "${REPORT_DIR}"
+set -Eeuo pipefail
+docker -H "${DOCKER_HOST}" volume create "${CACHE_VOLUME}" >/dev/null
 
-        # 1) Scan with Trivy (in container), output JSON into ./reports
-        OUT_BASE="${IMAGE_NAME//[:]/_}_${BUILD_NUMBER}"
-        OUT_JSON="${OUT_BASE}.json"
-        docker -H "$DOCKER_HOST" run --rm \
-          -e DOCKER_HOST="$DOCKER_HOST" \
-          -v "$PWD/${REPORT_DIR}:/reports" \
-          "aquasec/trivy:${TRIVY_TAG}" \
-          image --severity "${SEVERITY}" --format json \
-          -o "/reports/${OUT_JSON}" \
-          "${IMAGE_NAME}:${BUILD_NUMBER}"
+# Pull main vuln DB (and Java DB if full scan requested)
+docker -H "${DOCKER_HOST}" run --rm \
+  -v "${CACHE_VOLUME}:/root/.cache/trivy" \
+  "aquasec/trivy:${TRIVY_TAG}" --download-db-only || true
 
-        # 2) Make an HTML snapshot (simple pretty JSON → HTML)
-        docker run --rm -v "$PWD/${REPORT_DIR}:/reports" python:3.11 \
-          python -c "import json,html,sys; p='/reports/${OUT_JSON}'; d=json.load(open(p)); open('/reports/${OUT_BASE}.html','w').write('<html><body><h1>Trivy Report</h1><pre>'+html.escape(json.dumps(d, indent=2))+'</pre></body></html>')"
-
-        # 3) Back-compat filenames some scripts expect
-        cp "${REPORT_DIR}/${OUT_JSON}" "${REPORT_DIR}/${IMAGE_NAME}.filtered.json" || true
-        cp "${REPORT_DIR}/${OUT_BASE}.html" "${REPORT_DIR}/${IMAGE_NAME}.html" || true
-
-        echo "Saved: ${REPORT_DIR}/${OUT_JSON}"
-        echo "Saved: ${REPORT_DIR}/${OUT_BASE}.html"
-        '''
+if [[ "${SCAN_MODE}" == "full" ]]; then
+  docker -H "${DOCKER_HOST}" run --rm \
+    -v "${CACHE_VOLUME}:/root/.cache/trivy" \
+    "aquasec/trivy:${TRIVY_TAG}" --download-java-db-only || true
+fi
+'''
       }
     }
 
-    stage('Email & Gate (no mounts)') {
+    stage('Scan & Generate Report') {
       steps {
-        withCredentials([
-          string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
-          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
-        ]) {
-          sh '''#!/usr/bin/env bash
-          set -Eeuo pipefail
-          # Mount the workspace so we can reuse local code & reports
-          docker run --rm \
-            -e DOCKER_HOST -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-            -e SEVERITY="${SEVERITY}" \
-            -v "$PWD:/app" -w /app \
-            python:3.11 bash -lc "
-              pip install --no-cache-dir -r requirements.txt
-              python scanner/notify_email.py \
-                --image       '${IMAGE_NAME}:${BUILD_NUMBER}' \
-                --report-json 'reports/${IMAGE_NAME}.filtered.json' \
-                --report-html 'reports/${IMAGE_NAME}.html' \
-                --fail-on     '${SEVERITY}'
-            "
-          '''
+        sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+mkdir -p "${REPORT_DIR}"
+docker -H "${DOCKER_HOST}" volume create "${CACHE_VOLUME}" >/dev/null
+
+SCANNERS="vuln"
+[[ "${SECRET_SCAN}" == "true" ]] && SCANNERS="vuln,secret"
+
+# os mode avoids language DBs; full includes OS+library
+if [[ "${SCAN_MODE}" == "os" ]]; then
+  VULN_TYPE="os"
+else
+  VULN_TYPE="os,library"
+fi
+
+OUT_JSON="${IMAGE_NAME}.json"
+OUT_HTML="${IMAGE_NAME}.html"
+GATE_CODE="gate.code"
+
+# To avoid host-path mounts with remote DOCKER_HOST, we create a container, then docker cp the outputs.
+CMD=$'/bin/sh -lc \'set -e; mkdir -p /out; ' \
+'ec=0; trivy image ' \
+'--timeout 10m ' \
+'--scanners '"${SCANNERS}"' ' \
+'--vuln-type '"${VULN_TYPE}"' ' \
+'--severity "'"${SEVERITY}"'" ' \
+'--format json -o /out/'"${OUT_JSON}"' ' \
+'--exit-code 1 ' \
+'"${IMAGE_NAME}:${BUILD_NUMBER}"' \
+' || ec=$?; echo $ec >/out/'"${GATE_CODE}"'; ' \
+# Optional pretty HTML (fresh scan; fast with cache)
+'trivy image --timeout 10m --scanners '"${SCANNERS}"' --vuln-type '"${VULN_TYPE}"' --severity "'"${SEVERITY}"'" ' \
+'--format template --template "@/contrib/html.tpl" -o /out/'"${OUT_HTML}"' ' \
+'"${IMAGE_NAME}:${BUILD_NUMBER}"' ' \
+'\''
+
+CID=$(docker -H "${DOCKER_HOST}" create --name "trivy-${BUILD_TAG//[[:^alnum:]]/-}" \
+  -v "${CACHE_VOLUME}:/root/.cache/trivy" \
+  --entrypoint /bin/sh \
+  "aquasec/trivy:${TRIVY_TAG}" -lc "${CMD}"
+)
+
+# Run the scan
+docker -H "${DOCKER_HOST}" start -a "$CID"
+
+# Copy artifacts out
+docker -H "${DOCKER_HOST}" cp "$CID:/out/." "${REPORT_DIR}/"
+
+# Clean up container
+docker -H "${DOCKER_HOST}" rm "$CID" >/dev/null 2>&1 || true
+
+echo "Reports written to ${REPORT_DIR}/${OUT_JSON} and ${REPORT_DIR}/${OUT_HTML}"
+'''
+      }
+    }
+
+    stage('Gate (fail on severity)') {
+      steps {
+        script {
+          // Read the exit code Trivy produced (0 = pass, 1 = fail for selected severities)
+          def code = sh(returnStdout: true, script: "cat '${env.REPORT_DIR}/gate.code' 2>/dev/null || echo 0").trim()
+          echo "Trivy gate exit code: ${code}"
+          if (code == '1') {
+            currentBuild.result = 'FAILURE'
+            error("Vulnerabilities of severity [${params.SEVERITY}] found in ${params.IMAGE_NAME}:${env.BUILD_NUMBER}")
+          }
         }
       }
     }
@@ -132,6 +190,8 @@ pipeline {
   post {
     always {
       archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
+      // Optionally keep workspace tidy
+      // cleanWs()
     }
   }
 }
