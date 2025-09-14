@@ -6,195 +6,98 @@ pipeline {
   }
 
   environment {
-    // ---- image + scan configuration (tweak if you like) ----
-    IMAGE_NAME   = 'demo-app'          // the base image name in the email & report files
-    IMAGE_TAG    = 'dev'               // shown as demo-app:dev in the email (use "${BUILD_NUMBER}" if preferred)
-    DOCKERFILE   = 'DemoApp.Dockerfile'
-    FAIL_ON      = 'HIGH,CRITICAL'     // build fails if any of these severities are found
-    TRIVY_VER    = '0.52.2'            // Trivy version used by the scanner container
-    SMTP_HOST    = 'smtp.gmail.com'
-    SMTP_PORT    = '465'
+    SEVERITY = "HIGH,CRITICAL"
+    IMAGE_NAME = "demo-app"
+    IMAGE_TAG  = "dev"
+    DOCKERFILE = "DemoApp.Dockerfile"
   }
 
   stages {
+
     stage('Checkout') {
       steps { checkout scm }
     }
 
     stage('Docker availability') {
       steps {
-        // Use bash so we can safety-set pipefail etc.
-        sh '''
-          bash -lc '
-            set -Eeuo pipefail
-            command -v docker
-            docker version
-            echo "✅ Docker reachable"
-          '
+        sh '''#!/usr/bin/env bash
+          set -Eeuo pipefail
+          command -v docker
+          docker version
+          echo "✅ Docker reachable"
         '''
       }
     }
 
     stage('Build image') {
       steps {
-        sh '''
-          bash -lc "
-            set -Eeuo pipefail
-            echo 'Building ${IMAGE_NAME}:${IMAGE_TAG}'
-            DOCKER_BUILDKIT=0 docker build \
-              --pull \
-              -f '${DOCKERFILE}' \
-              -t '${IMAGE_NAME}:${IMAGE_TAG}' \
-              .
-            mkdir -p reports
-          "
+        sh '''#!/usr/bin/env bash
+          set -Eeuo pipefail
+          echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
+          # Use legacy builder off (BuildKit on) unless you specifically want legacy
+          docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+          mkdir -p reports
         '''
       }
     }
 
     stage('Scan & Generate Report') {
       steps {
-        // 1) Run Trivy from its official container (no huge apt installs)
-        sh '''
-          bash -lc "
-            set -Eeuo pipefail
-            # raw Trivy JSON
-            docker run --rm \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              -v \"$PWD\":/work -w /work \
-              aquasec/trivy:${TRIVY_VER} image \
-                --timeout 40m \
-                --format json \
-                --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
-                --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db:1 \
-                --quiet \
-                '${IMAGE_NAME}:${IMAGE_TAG}' > 'reports/${IMAGE_NAME}.json' || true
-          "
+        // 1) Run Trivy (dockerized) to produce raw JSON (non-fatal if it finds vulns)
+        sh '''#!/usr/bin/env bash
+          set -Eeuo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$WORKSPACE":/work -w /work \
+            aquasec/trivy:0.52.2 image \
+              --timeout 40m \
+              --format json \
+              --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
+              --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db:1 \
+              --quiet \
+              "${IMAGE_NAME}:${IMAGE_TAG}" > "reports/${IMAGE_NAME}.json" || true
         '''
 
-        // 2) Use the repo’s Python helpers to filter + render HTML
-        sh '''
-          bash -lc "
-            set -Eeuo pipefail
-            docker run --rm -v \"$PWD\":/work -w /work python:3.11-slim bash -lc '
+        // 2) Run our Python wrappers in a clean container
+        sh '''#!/usr/bin/env bash
+          set -Eeuo pipefail
+          docker run --rm \
+            -v "$WORKSPACE":/work -w /work \
+            python:3.11-slim bash -lc '
               set -Eeuo pipefail
               python -V
-              # requirements are optional; ignore if the file is absent
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-              # wrapper modules from this repo
-              python -m scanner.scan   \"${IMAGE_NAME}:${IMAGE_TAG}\" \"reports/${IMAGE_NAME}.json\"
-              python -m scanner.report \"reports/${IMAGE_NAME}.filtered.json\" \"reports/${IMAGE_NAME}.html\"
+              # Use direct script paths (avoid module import issues)
+              python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
+              python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
               ls -al reports
             '
-          "
         '''
       }
     }
 
-    stage('Email summary + Gate') {
+    stage('Email summary + Gate (Gmail)') {
       steps {
         withCredentials([
           string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
           string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO'),
-          string(credentialsId: 'EMAIL_FROM_NAME',    variable: 'EMAIL_FROM_NAME')
+          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
-          // Send the email (attachments: html + filtered.json + raw.json), compute counts, write gate status
-          sh '''
-            bash -lc '
-              set -Eeuo pipefail
-
-              docker run --rm -i \
-                -e GMAIL_USER="$GMAIL_USER" \
-                -e GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD" \
-                -e EMAIL_TO="$EMAIL_TO" \
-                -e EMAIL_FROM_NAME="$EMAIL_FROM_NAME" \
-                -e SMTP_HOST="${SMTP_HOST}" \
-                -e SMTP_PORT="${SMTP_PORT}" \
-                -e IMAGE_NAME="${IMAGE_NAME}" \
-                -e IMAGE_TAG="${IMAGE_TAG}" \
-                -e FAIL_ON="${FAIL_ON}" \
-                -v "$PWD":/work -w /work \
-                python:3.11-slim \
-                python - << "PY"
-import os, json, mimetypes, email.utils, ssl, smtplib, pathlib
-
-from email.message import EmailMessage
-
-img = f"{os.environ.get('IMAGE_NAME','myapp')}:{os.environ.get('IMAGE_TAG','')}"
-base = os.environ.get('IMAGE_NAME','myapp')
-p_json = f"reports/{base}.filtered.json"
-p_html = f"reports/{base}.html"
-p_raw  = f"reports/{base}.json"
-
-# Count severities
-crit=high=med=low=0; total=0
-if os.path.exists(p_json):
-    js = json.load(open(p_json))
-    # accept either {"Vulnerabilities":[...]} or a list
-    vulns = js.get("Vulnerabilities", js if isinstance(js, list) else [])
-    for v in vulns:
-        total += 1
-        sev = (v.get("Severity","") or "").upper()
-        if sev == "CRITICAL": crit += 1
-        elif sev == "HIGH":   high += 1
-        elif sev == "MEDIUM": med  += 1
-        elif sev == "LOW":    low  += 1
-
-gate_levels = {s.strip().upper() for s in os.environ.get("FAIL_ON","HIGH,CRITICAL").split(",") if s.strip()}
-should_fail = (
-    ("CRITICAL" in gate_levels and crit>0) or
-    ("HIGH"     in gate_levels and high>0) or
-    ("MEDIUM"   in gate_levels and med>0) or
-    ("LOW"      in gate_levels and low>0)
-)
-status = "FAIL" if should_fail else "PASS"
-
-subject = f"[VulnScan] {status} {img} C:{crit} H:{high} (total {total})"
-body = (
-    f"Image: {img}\\n"
-    f"Summary: total {total} vulnerabilities\\n"
-    f"CRITICAL: {crit}, HIGH: {high}, MEDIUM: {med}, LOW: {low}\\n"
-    f"Gate (fail-on): {', '.join(sorted(gate_levels))}\\n\\n"
-    "Reports attached."
-)
-
-msg = EmailMessage()
-msg["To"]   = os.environ["EMAIL_TO"]
-msg["From"] = email.utils.formataddr((os.environ.get("EMAIL_FROM_NAME","Vuln Scanner"),
-                                      os.environ["GMAIL_USER"]))
-msg["Subject"] = subject
-msg.set_content(body)
-
-for path in [p_html, p_json, p_raw]:
-    if os.path.exists(path):
-        ctype,_ = mimetypes.guess_type(path)
-        maintype, subtype = (ctype or "application/octet-stream").split("/",1)
-        with open(path, "rb") as fh:
-            msg.add_attachment(fh.read(), maintype=maintype, subtype=subtype,
-                               filename=pathlib.Path(path).name)
-
-ctx = ssl.create_default_context()
-with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST","smtp.gmail.com"),
-                      int(os.environ.get("SMTP_PORT","465")), context=ctx) as s:
-    s.login(os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"])
-    s.send_message(msg)
-
-open("reports/.gate_status","w").write(status)
-print(subject)
-PY
-            '
+          sh '''#!/usr/bin/env bash
+            set -Eeuo pipefail
+            docker run --rm \
+              -v "$WORKSPACE":/work -w /work \
+              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              python:3.11-slim bash -lc "
+                set -Eeuo pipefail
+                [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+                python scanner/notify_email.py \
+                  --image       \\"${IMAGE_NAME}:${IMAGE_TAG}\\" \
+                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \
+                  --report-html \\"reports/${IMAGE_NAME}.html\\" \
+                  --fail-on     \\"${SEVERITY}\\"
+              "
           '''
-
-          script {
-            def gate = sh(script: 'cat reports/.gate_status || echo PASS', returnStdout: true).trim()
-            if (gate == 'FAIL') {
-              currentBuild.result = 'FAILURE'
-              error('❌ Vulnerability gate failed (see email/report).')
-            } else {
-              echo '✅ Vulnerability gate passed.'
-            }
-          }
         }
       }
     }
@@ -202,7 +105,7 @@ PY
 
   post {
     always {
-      archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true, onlyIfSuccessful: false
+      archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
     }
   }
 }
