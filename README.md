@@ -1,5 +1,8 @@
 
 # Container Image Vulnerability Scanner — Trivy + Gmail (+ CI/CD + Grafana)
+#Group 14 
+#Jay Gupta
+#Janhvi Dahake
 
 An end-to-end starter to **scan Docker images with Trivy**, **fail the pipeline on HIGH/CRITICAL**,
 **email results via Gmail**, and (optionally) **export metrics for Grafana**.
